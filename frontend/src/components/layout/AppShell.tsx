@@ -31,6 +31,7 @@ import AIIntakePage from '@/pages/AIIntakePage';
 import DocumentVaultPage from '@/pages/DocumentVaultPage';
 import PreferencesPage from '@/pages/PreferencesPage';
 import PaymentsPage from '@/pages/PaymentsPage';
+import AdminPortalPage from '@/pages/AdminPortalPage';
 
 type NavItem = { id: string; path: string; label: string; icon: React.ElementType; section: string };
 
@@ -50,6 +51,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'templates', path: '/templates', label: 'Πρότυπα', icon: FileCheck, section: 'templates' },
   { id: 'reports', path: '/reports', label: 'Αναφορές', icon: BarChart3, section: 'reports' },
   { id: 'users', path: '/users', label: 'Χρήστες', icon: Shield, section: 'users' },
+  { id: 'admin-portal', path: '/admin-portal', label: 'Πύλη Πελάτη', icon: Lock, section: 'users' },
   { id: 'settings', path: '/settings', label: 'Ρυθμίσεις', icon: Settings, section: 'settings' },
 ];
 
@@ -116,7 +118,7 @@ export default function AppShell() {
     '/reports': 'Αναφορές', '/audit': 'Audit Log', '/users': 'Χρήστες',
     '/settings': 'Ρυθμίσεις', '/profile': 'Προφίλ', '/bot': 'Nomos AI',
     '/intake': 'AI Document Intake', '/documents': 'Θησαυροφυλάκιο', '/preferences': 'Προτιμήσεις',
-    '/payments': 'Πληρωμές',
+    '/payments': 'Πληρωμές', '/admin-portal': 'Διαχείριση Πύλης Πελάτη',
   };
 
   // Mock notifications
@@ -359,6 +361,7 @@ export default function AppShell() {
             <Route path="/reports" element={<ReportsPage />} />
             <Route path="/audit" element={<AuditPage />} />
             <Route path="/users" element={<UsersPage />} />
+            <Route path="/admin-portal" element={<AdminPortalPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/profile" element={<ProfilePage />} />
             <Route path="/bot" element={<SkotanisBot />} />
