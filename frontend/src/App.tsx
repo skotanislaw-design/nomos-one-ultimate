@@ -1,11 +1,14 @@
+import { useEffect } from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
 import { PortalAuthProvider, usePortalAuth } from '@/contexts/PortalAuthContext';
+import { WebSocketProvider } from '@/contexts/WebSocketContext';
 import { Toaster } from 'sonner';
 import AppShell from '@/components/layout/AppShell';
 import LoginPage from '@/pages/LoginPage';
 import ClientPortalLoginPage from '@/pages/ClientPortalLoginPage';
 import ClientPortalPage from '@/pages/ClientPortalPage';
+import { initializeFirebase } from '@/lib/firebase';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
@@ -34,11 +37,20 @@ function PortalProtectedRoute({ children }: { children: React.ReactNode }) {
 }
 
 export default function App() {
+  // Initialize Firebase on app load
+  useEffect(() => {
+    initializeFirebase().catch(err => {
+      console.warn('[App] Firebase initialization error:', err);
+      // Non-critical, app continues without Firebase
+    });
+  }, []);
+
   return (
     <AuthProvider>
-      <PortalAuthProvider>
-        <Toaster position="top-right" theme="dark" richColors />
-        <Routes>
+      <WebSocketProvider>
+        <PortalAuthProvider>
+          <Toaster position="top-right" theme="dark" richColors />
+          <Routes>
           {/* Main app routes */}
           <Route path="/login" element={<LoginPage />} />
           <Route path="/*" element={<ProtectedRoute><AppShell /></ProtectedRoute>} />
@@ -47,7 +59,8 @@ export default function App() {
           <Route path="/portal/login" element={<ClientPortalLoginPage />} />
           <Route path="/portal/dashboard" element={<PortalProtectedRoute><ClientPortalPage /></PortalProtectedRoute>} />
         </Routes>
-      </PortalAuthProvider>
+        </PortalAuthProvider>
+      </WebSocketProvider>
     </AuthProvider>
   );
 }

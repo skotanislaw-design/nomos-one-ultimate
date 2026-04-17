@@ -28,6 +28,14 @@ import re
 from enum import Enum
 from pathlib import Path
 
+# ── PWA & Mobile Services ─────────────────────────────────────────────────────
+from device_service import get_device_service
+from push_service import get_push_service
+
+# ── WebSocket & Real-time Messaging (Phase 1.7) ────────────────────────────────
+from websocket_service import get_websocket_manager
+from websocket_routes import router as ws_router, set_jwt_secret
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("nomos_one")
@@ -164,6 +172,19 @@ async def startup():
         year = datetime.utcnow().year
         count = await db.cases.count_documents({"case_number": {"$regex": f"^{year}-"}})
         await db.counters.update_one({"_id": "case_number"}, {"$set": {"year": year, "seq": count}}, upsert=True)
+
+    # ── Phase 1.7: WebSocket Real-time Messaging ───────────────────────────
+    # Initialize WebSocket manager
+    ws_manager = get_websocket_manager()
+    logger.info(f"WebSocket manager initialized: {ws_manager}")
+
+    # Configure WebSocket routes with JWT secret
+    set_jwt_secret(JWT_SECRET)
+
+    # Include WebSocket router
+    app.include_router(ws_router)
+    logger.info("WebSocket routes registered")
+
     logger.info("Database connected and indexes created")
     await seed_default_admin()
 
@@ -363,6 +384,18 @@ class UpdateUserRequest(BaseModel):
     name: Optional[str] = None; email: Optional[str] = None
     role: Optional[UserRole] = None; is_active: Optional[bool] = None
     password: Optional[str] = None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PWA & MOBILE - API v1
+# ══════════════════════════════════════════════════════════════════════════════
+class RegisterDeviceRequest(BaseModel):
+    device_name: str = Field(..., min_length=1, max_length=255)
+    device_type: str = Field(..., description="ios | android | web | desktop")
+    push_token: str = Field(..., min_length=1)
+    app_version: str = Field(..., description="e.g., 1.0.0")
+
+class TrustDeviceRequest(BaseModel):
+    device_name: Optional[str] = None
 
 @app.get("/api/users")
 async def list_users(user=Depends(require_role(UserRole.ADMIN))):
@@ -2812,3 +2845,225 @@ async def export_cases_excel(user=Depends(get_current_user)):
     out = io.BytesIO(); wb.save(out); out.seek(0)
     return StreamingResponse(out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=cases.xlsx"})
+
+# ══════════════════════════════════════════════════════════════════════════════
+# API v1 ROUTES - MOBILE & PWA SUPPORT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/v1/auth/register-device", status_code=201)
+async def register_device_v1(
+    req: RegisterDeviceRequest,
+    user=Depends(get_current_user),
+    request: Request = None
+):
+    """Register a new device for push notifications"""
+    if req.device_type not in ["ios", "android", "web", "desktop"]:
+        raise HTTPException(status_code=400, detail="Invalid device_type")
+
+    try:
+        device_service = get_device_service(db)
+        result = await device_service.register_device(
+            user_id=str(user["_id"]),
+            device_name=req.device_name,
+            device_type=req.device_type,
+            push_token=req.push_token,
+            app_version=req.app_version,
+            user_agent=request.headers.get("user-agent", "") if request else ""
+        )
+
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        await audit("device_registered", user["_id"], "device", details={
+            "device_type": req.device_type,
+            "is_new": result.get("is_new", False)
+        })
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Device registration failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to register device")
+
+
+@app.get("/api/v1/auth/register-device")
+async def list_user_devices_v1(user=Depends(get_current_user)):
+    """Get all devices registered for current user"""
+    try:
+        device_service = get_device_service(db)
+        devices = await device_service.get_user_devices(str(user["_id"]))
+        return devices
+    except Exception as e:
+        logger.error(f"Failed to list devices: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve devices")
+
+
+@app.post("/api/v1/auth/register-device/{device_id}/trust")
+async def trust_device_v1(
+    device_id: str,
+    req: TrustDeviceRequest,
+    user=Depends(get_current_user)
+):
+    """Mark device as trusted (skip 2FA for 30 days)"""
+    try:
+        device_service = get_device_service(db)
+        success = await device_service.trust_device(
+            device_id=device_id,
+            user_id=str(user["_id"]),
+            device_name=req.device_name
+        )
+
+        if not success:
+            raise HTTPException(status_code=404, detail="Device not found")
+
+        await audit("device_trusted", user["_id"], "device", resource_id=device_id)
+        return {"status": "trusted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to trust device: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to trust device")
+
+
+@app.delete("/api/v1/auth/register-device/{device_id}")
+async def unregister_device_v1(
+    device_id: str,
+    user=Depends(get_current_user)
+):
+    """Unregister/delete a device"""
+    try:
+        device_service = get_device_service(db)
+        success = await device_service.unregister_device(
+            device_id=device_id,
+            user_id=str(user["_id"])
+        )
+
+        if not success:
+            raise HTTPException(status_code=404, detail="Device not found")
+
+        await audit("device_unregistered", user["_id"], "device", resource_id=device_id)
+        return {"status": "unregistered"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to unregister device: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to unregister device")
+
+
+@app.get("/api/v1/cases/sync")
+async def delta_sync_v1(
+    last_sync: Optional[datetime] = None,
+    device_id: Optional[str] = None,
+    user=Depends(get_current_user)
+):
+    """Delta sync: Get only case data modified since last sync (optimized for mobile)"""
+    try:
+        sync_time = last_sync or (datetime.utcnow() - timedelta(days=30))
+
+        # Get cases assigned to user that have been modified
+        cases_cursor = db.cases.find({
+            "$or": [
+                {"assigned_lawyer_id": ObjectId(user["_id"])},
+                {"assigned_secretary_id": ObjectId(user["_id"])}
+            ],
+            "updated_at": {"$gte": sync_time}
+        }).sort("updated_at", -1).limit(100)
+
+        cases = []
+        async for case in cases_cursor:
+            cases.append(serialize(case))
+
+        # Get documents modified since last sync
+        documents_cursor = db.documents.find({
+            "updated_at": {"$gte": sync_time}
+        }).sort("updated_at", -1).limit(100)
+
+        documents = []
+        async for doc in documents_cursor:
+            documents.append(serialize(doc))
+
+        return {
+            "cases": cases,
+            "documents": documents,
+            "messages": [],
+            "updates": [],
+            "last_sync_at": datetime.utcnow().isoformat(),
+            "has_more": False
+        }
+    except Exception as e:
+        logger.error(f"Delta sync failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Sync failed")
+
+
+@app.post("/api/v1/auth/logout")
+async def logout_device_v1(
+    device_id: Optional[str] = None,
+    user=Depends(get_current_user)
+):
+    """Logout from a specific device or all devices"""
+    try:
+        if device_id:
+            device_service = get_device_service(db)
+            await device_service.revoke_device_trust(device_id, str(user["_id"]))
+            await audit("device_logout", user["_id"], "device", resource_id=device_id)
+        else:
+            # Logout from all devices
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                {"$set": {"trusted_devices": []}}
+            )
+            await audit("logout_all_devices", user["_id"], "user")
+
+        return {"status": "logged_out"}
+    except Exception as e:
+        logger.error(f"Logout failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Logout failed")
+
+
+@app.get("/api/v1/auth/me")
+async def get_current_user_info_v1(user=Depends(get_current_user)):
+    """Get current authenticated user info (v1 enhanced with devices)"""
+    try:
+        device_service = get_device_service(db)
+        devices = await device_service.get_user_devices(str(user["_id"]))
+
+        user_copy = serialize(user)
+        user_copy["devices"] = devices
+        user_copy["app_preferences"] = user.get("app_preferences", {
+            "notification_enabled": True,
+            "offline_mode_enabled": True
+        })
+        user_copy.pop("password", None)
+
+        return user_copy
+    except Exception as e:
+        logger.error(f"Failed to get user info: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve user info")
+
+
+@app.get("/api/v1/health")
+async def health_check_v1():
+    """API health check and version information"""
+    return {
+        "status": "ok",
+        "version": "1.0.0",
+        "min_app_version": "1.0.0",
+        "required_app_version": None,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@app.get("/api/v1/config/app")
+async def get_app_config_v1(user: Optional[Dict] = None):
+    """Get app configuration for mobile clients"""
+    return {
+        "api_version": "1.0.0",
+        "features": {
+            "offline_mode": True,
+            "push_notifications": True,
+            "websocket_messaging": True,
+            "two_factor_auth": False
+        },
+        "websocket_url": "ws://localhost:8000/ws"
+    }
