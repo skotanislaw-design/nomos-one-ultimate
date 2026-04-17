@@ -149,6 +149,7 @@ export const dashboardApi = {
 // ═══════════════ AUDIT ═══════════════
 export const auditApi = {
   logs: (params?: any) => api.get('/api/audit-logs', { params }),
+  listByCaseId: (caseId: string) => api.get(`/api/audit-logs?case_id=${caseId}`),
 };
 
 // ═══════════════ SETTINGS ═══════════════

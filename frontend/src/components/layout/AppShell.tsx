@@ -19,6 +19,7 @@ import ExpensesPage from '@/pages/ExpensesPage';
 import InvoicingPage from '@/pages/InvoicingPage';
 import BillingPage from '@/pages/BillingPage';
 import CRMWorkflowPage from '@/pages/CRMWorkflowPage';
+import ReceiptPage from '@/pages/ReceiptPage';
 import TemplatesPage from '@/pages/TemplatesPage';
 import ReportsPage from '@/pages/ReportsPage';
 import AuditPage from '@/pages/AuditPage';
@@ -41,6 +42,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'calendar', path: '/calendar', label: 'Ημερολόγιο', icon: Calendar, section: 'calendar' },
   { id: 'expenses', path: '/expenses', label: 'Έξοδα', icon: Receipt, section: 'expenses' },
   { id: 'invoicing', path: '/invoicing', label: 'Τιμολόγηση', icon: CreditCard, section: 'invoicing' },
+  { id: 'receipt', path: '/receipt', label: 'Αποδείξεις', icon: Receipt, section: 'invoicing' },
   { id: 'payments', path: '/payments', label: 'Πληρωμές', icon: Banknote, section: 'invoicing' },
   { id: 'billing', path: '/billing', label: 'Billing Engine', icon: TrendingUp, section: 'billing' },
   { id: 'intake', path: '/intake', label: 'AI Intake', icon: Inbox, section: 'dashboard' },
@@ -110,7 +112,7 @@ export default function AppShell() {
   const pageTitles: Record<string, string> = {
     '/': 'Dashboard', '/clients': 'Πελάτες', '/cases': 'Υποθέσεις', '/calendar': 'Ημερολόγιο',
     '/expenses': 'Έξοδα', '/invoicing': 'Τιμολόγηση', '/billing': 'Billing Engine',
-    '/crm-workflow': 'CRM & Workflow', '/templates': 'Πρότυπα',
+    '/crm-workflow': 'CRM & Workflow', '/receipt': 'Αποδείξεις', '/templates': 'Πρότυπα',
     '/reports': 'Αναφορές', '/audit': 'Audit Log', '/users': 'Χρήστες',
     '/settings': 'Ρυθμίσεις', '/profile': 'Προφίλ', '/bot': 'Nomos AI',
     '/intake': 'AI Document Intake', '/documents': 'Θησαυροφυλάκιο', '/preferences': 'Προτιμήσεις',
@@ -352,6 +354,7 @@ export default function AppShell() {
             <Route path="/invoicing" element={<InvoicingPage />} />
             <Route path="/billing" element={<BillingPage />} />
             <Route path="/crm-workflow" element={<CRMWorkflowPage />} />
+            <Route path="/receipt" element={<ReceiptPage />} />
             <Route path="/templates" element={<TemplatesPage />} />
             <Route path="/reports" element={<ReportsPage />} />
             <Route path="/audit" element={<AuditPage />} />
