@@ -233,4 +233,79 @@ export const healthApi = {
   check: () => api.get('/api/health'),
 };
 
+// ═══════════════ PORTAL ═══════════════
+// Separate API instance for portal with portal token
+const portalApi_instance = axios.create({ baseURL: API_URL });
+
+// Auto-attach portal JWT token
+portalApi_instance.interceptors.request.use((config) => {
+  const token = localStorage.getItem('nomos_portal_token');
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+// Auto-logout on 401 for portal
+portalApi_instance.interceptors.response.use(
+  (res) => res,
+  (err) => {
+    if (err.response?.status === 401 && !err.config.url?.includes('/api/portal/auth')) {
+      localStorage.removeItem('nomos_portal_token');
+      window.location.href = '/portal/login';
+    }
+    return Promise.reject(err);
+  }
+);
+
+export const portalApi = {
+  // Portal authentication
+  login: (name: string, case_category: string, portal_code: string) =>
+    portalApi_instance.post('/api/portal/auth', { name, case_category, portal_code }),
+
+  // Portal case access
+  getCase: () => portalApi_instance.get('/api/portal/my-case'),
+  getEvents: () => portalApi_instance.get('/api/portal/case-events'),
+
+  // Portal messaging
+  sendMessage: (content: string, subject?: string) =>
+    portalApi_instance.post('/api/portal/messages', { content, subject }),
+
+  // Portal document upload
+  uploadDocument: (file: File) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    return portalApi_instance.post('/api/portal/upload', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    });
+  },
+
+  // Portal forgot password
+  forgotPassword: (name: string, case_category: string) =>
+    portalApi_instance.post('/api/portal/forgot-password', { name, case_category }),
+};
+
+// ═══════════════ ADMIN PORTAL MANAGEMENT ═══════════════
+export const adminPortalApi = {
+  // Generate portal access for a case
+  generatePortalAccess: (client_id: string, case_id: string, permissions?: string[]) =>
+    api.post(`/api/admin/clients/${client_id}/generate-portal-access`, { permissions }),
+
+  // Update portal permissions
+  updatePortalPermissions: (case_id: string, permissions: string[]) =>
+    api.patch(`/api/admin/cases/${case_id}/portal-permissions`, { permissions }),
+
+  // List portal access codes (admin view)
+  listPortalAccess: () => api.get('/api/admin/portal-access'),
+
+  // List password reset requests
+  listResetRequests: () => api.get('/api/admin/portal-reset-requests'),
+
+  // Approve password reset request
+  approveResetRequest: (request_id: string) =>
+    api.post(`/api/admin/portal-reset-requests/${request_id}/approve`),
+
+  // Reject password reset request
+  rejectResetRequest: (request_id: string) =>
+    api.post(`/api/admin/portal-reset-requests/${request_id}/reject`),
+};
+
 export default api;
