@@ -300,6 +300,8 @@ async def login(req: LoginRequest):
         raise HTTPException(401, "Λάθος email ή κωδικός")
     if not user.get("is_active", True):
         raise HTTPException(403, "Ο λογαριασμός είναι ανενεργός")
+    if not user.get("is_approved", True):
+        raise HTTPException(403, "Ο λογαριασμός σας δεν έχει εγκριθεί ακόμα από τον διαχειριστή")
     rate_limiter.clear(email)
     token = create_token({"sub": str(user["_id"]), "role": user["role"]})
     await audit("LOGIN", str(user["_id"]), "auth")
@@ -334,6 +336,9 @@ async def change_password(req: ChangePasswordRequest, user=Depends(get_current_u
 class CreateUserRequest(BaseModel):
     email: str; name: str; password: str; role: UserRole
 
+class RegisterUserRequest(BaseModel):
+    email: str; name: str; password: str
+
 class UpdateUserRequest(BaseModel):
     name: Optional[str] = None; email: Optional[str] = None
     role: Optional[UserRole] = None; is_active: Optional[bool] = None
@@ -352,7 +357,7 @@ async def create_user(req: CreateUserRequest, user=Depends(require_role(UserRole
     if not is_valid: raise HTTPException(400, err)
     if await db.users.find_one({"email": email}): raise HTTPException(409, "Το email χρησιμοποιείται ήδη")
     doc = {"email": email, "name": sanitize_string(req.name), "password": hash_password(req.password),
-           "role": req.role.value, "is_active": True, "created_at": datetime.utcnow(), "must_change_password": True}
+           "role": req.role.value, "is_active": True, "is_approved": True, "created_at": datetime.utcnow(), "must_change_password": True}
     result = await db.users.insert_one(doc)
     await audit("CREATE_USER", user["id"], "user", str(result.inserted_id))
     doc["_id"] = result.inserted_id
@@ -387,6 +392,54 @@ async def delete_user(user_id: str, user=Depends(require_role(UserRole.ADMIN))):
     await db.users.delete_one({"_id": make_id(user_id)})
     await audit("DELETE_USER", user["id"], "user", user_id)
     return {"ok": True}
+
+# ── User Registration (Public) ──
+@app.post("/api/auth/register", status_code=201)
+async def register_user(req: RegisterUserRequest):
+    """Δημόσια εγγραφή χρήστη — δημιουργεί pending user που χρειάζεται έγκριση"""
+    email = req.email.strip().lower()
+    if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+        raise HTTPException(400, "Μη έγκυρη μορφή email")
+    is_valid, err = validate_password(req.password)
+    if not is_valid:
+        raise HTTPException(400, err)
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(409, "Το email χρησιμοποιείται ήδη")
+    doc = {"email": email, "name": sanitize_string(req.name), "password": hash_password(req.password),
+           "role": UserRole.LAWYER.value, "is_active": True, "is_approved": False,
+           "created_at": datetime.utcnow(), "must_change_password": True}
+    result = await db.users.insert_one(doc)
+    await audit("REGISTER_USER", str(result.inserted_id), "user", str(result.inserted_id))
+    return {"message": "Εγγραφή επιτυχής. Περιμένετε την έγκριση διαχειριστή.", "email": email}
+
+# ── Admin: List Pending Users ──
+@app.get("/api/admin/pending-users")
+async def list_pending_users(user=Depends(require_role(UserRole.ADMIN))):
+    """Λίστα χρηστών που περιμένουν έγκριση"""
+    users = await db.users.find({"is_approved": False}).to_list(None)
+    return [{k: v for k, v in serialize(u).items() if k != "password"} for u in users]
+
+# ── Admin: Approve User ──
+@app.post("/api/admin/users/{user_id}/approve")
+async def approve_user(user_id: str, user=Depends(require_role(UserRole.ADMIN))):
+    """Έγκριση χρήστη για πρόσβαση στο σύστημα"""
+    result = await db.users.update_one({"_id": make_id(user_id)}, {"$set": {"is_approved": True}})
+    if result.matched_count == 0:
+        raise HTTPException(404, "Χρήστης δεν βρέθηκε")
+    await audit("APPROVE_USER", user["id"], "user", user_id)
+    return {"ok": True, "message": "Χρήστης εγκρίθηκε"}
+
+# ── Admin: Reject User ──
+@app.post("/api/admin/users/{user_id}/reject")
+async def reject_user(user_id: str, user=Depends(require_role(UserRole.ADMIN))):
+    """Απόρριψη και διαγραφή χρήστη"""
+    if user_id == user["id"]:
+        raise HTTPException(400, "Δεν μπορείτε να απορρίψετε τον εαυτό σας")
+    result = await db.users.delete_one({"_id": make_id(user_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Χρήστης δεν βρέθηκε")
+    await audit("REJECT_USER", user["id"], "user", user_id)
+    return {"ok": True, "message": "Χρήστης απορρίφθηκε"}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CLIENTS

@@ -18,8 +18,7 @@ import CalendarPage from '@/pages/CalendarPage';
 import ExpensesPage from '@/pages/ExpensesPage';
 import InvoicingPage from '@/pages/InvoicingPage';
 import BillingPage from '@/pages/BillingPage';
-import PipelinePage from '@/pages/PipelinePage';
-import WorkflowPage from '@/pages/WorkflowPage';
+import CRMWorkflowPage from '@/pages/CRMWorkflowPage';
 import TemplatesPage from '@/pages/TemplatesPage';
 import ReportsPage from '@/pages/ReportsPage';
 import AuditPage from '@/pages/AuditPage';
@@ -45,8 +44,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'payments', path: '/payments', label: 'Πληρωμές', icon: Banknote, section: 'invoicing' },
   { id: 'billing', path: '/billing', label: 'Billing Engine', icon: TrendingUp, section: 'billing' },
   { id: 'intake', path: '/intake', label: 'AI Intake', icon: Inbox, section: 'dashboard' },
-  { id: 'pipeline', path: '/pipeline', label: 'Pipeline CRM', icon: GitBranch, section: 'pipeline' },
-  { id: 'workflow', path: '/workflow', label: 'Workflow', icon: ClipboardList, section: 'workflow' },
+  { id: 'crm-workflow', path: '/crm-workflow', label: 'CRM & Workflow', icon: GitBranch, section: 'crm' },
   { id: 'templates', path: '/templates', label: 'Πρότυπα', icon: FileCheck, section: 'templates' },
   { id: 'reports', path: '/reports', label: 'Αναφορές', icon: BarChart3, section: 'reports' },
   { id: 'users', path: '/users', label: 'Χρήστες', icon: Shield, section: 'users' },
@@ -112,7 +110,7 @@ export default function AppShell() {
   const pageTitles: Record<string, string> = {
     '/': 'Dashboard', '/clients': 'Πελάτες', '/cases': 'Υποθέσεις', '/calendar': 'Ημερολόγιο',
     '/expenses': 'Έξοδα', '/invoicing': 'Τιμολόγηση', '/billing': 'Billing Engine',
-    '/pipeline': 'Pipeline CRM', '/workflow': 'Workflow', '/templates': 'Πρότυπα',
+    '/crm-workflow': 'CRM & Workflow', '/templates': 'Πρότυπα',
     '/reports': 'Αναφορές', '/audit': 'Audit Log', '/users': 'Χρήστες',
     '/settings': 'Ρυθμίσεις', '/profile': 'Προφίλ', '/bot': 'Nomos AI',
     '/intake': 'AI Document Intake', '/documents': 'Θησαυροφυλάκιο', '/preferences': 'Προτιμήσεις',
@@ -353,8 +351,7 @@ export default function AppShell() {
             <Route path="/expenses" element={<ExpensesPage />} />
             <Route path="/invoicing" element={<InvoicingPage />} />
             <Route path="/billing" element={<BillingPage />} />
-            <Route path="/pipeline" element={<PipelinePage />} />
-            <Route path="/workflow" element={<WorkflowPage />} />
+            <Route path="/crm-workflow" element={<CRMWorkflowPage />} />
             <Route path="/templates" element={<TemplatesPage />} />
             <Route path="/reports" element={<ReportsPage />} />
             <Route path="/audit" element={<AuditPage />} />

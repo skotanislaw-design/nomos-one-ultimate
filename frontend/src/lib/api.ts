@@ -38,6 +38,11 @@ export const usersApi = {
   update: (id: string, data: any) => api.put(`/api/users/${id}`, data),
   delete: (id: string) => api.delete(`/api/users/${id}`),
   lawyers: () => api.get('/api/users/lawyers'),
+  // User registration and approval
+  register: (data: any) => api.post('/api/auth/register', data),
+  listPendingUsers: () => api.get('/api/admin/pending-users'),
+  approveUser: (id: string) => api.post(`/api/admin/users/${id}/approve`),
+  rejectUser: (id: string) => api.post(`/api/admin/users/${id}/reject`),
 };
 
 // ═══════════════ CLIENTS ═══════════════
