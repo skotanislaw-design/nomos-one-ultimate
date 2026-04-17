@@ -1,0 +1,89 @@
+version: '3.8'
+
+services:
+
+  # ── MongoDB ─────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: nomos_mongo
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-nomos_admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-CHANGE_ME}
+      MONGO_INITDB_DATABASE: ${DB_NAME:-nomos_one}
+    networks:
+      - nomos_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Backend (FastAPI) ────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: nomos_backend
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      MONGO_URI: mongodb://${MONGO_USER:-nomos_admin}:${MONGO_PASSWORD:-CHANGE_ME}@mongodb:27017/?authSource=admin
+      DB_NAME: ${DB_NAME:-nomos_one}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRY_HOURS: ${JWT_EXPIRY_HOURS:-8}
+      DOCUMENT_STORAGE_PATH: /data/documents
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-50}
+      STAGNANT_DAYS: ${STAGNANT_DAYS:-30}
+      MIN_PASSWORD_LENGTH: ${MIN_PASSWORD_LENGTH:-8}
+      MAX_LOGIN_ATTEMPTS: ${MAX_LOGIN_ATTEMPTS:-5}
+      LOGIN_LOCKOUT_MINUTES: ${LOGIN_LOCKOUT_MINUTES:-15}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-christos@skotanislaw.com}
+      ADMIN_NAME: ${ADMIN_NAME:-Χρήστος Σκοτάνης}
+      ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-}
+      # SMTP (optional — fallback to DB logging if not set)
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-Nomos One}
+    volumes:
+      - document_data:/data/documents
+    networks:
+      - nomos_net
+    # NOT exposed externally — nginx proxies to it
+    expose:
+      - "8000"
+
+  # ── Frontend (Nginx + React) ─────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-}
+    container_name: nomos_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+    networks:
+      - nomos_net
+
+volumes:
+  mongo_data:
+    driver: local
+  document_data:
+    driver: local
+
+networks:
+  nomos_net:
+    driver: bridge

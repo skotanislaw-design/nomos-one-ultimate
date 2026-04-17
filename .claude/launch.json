@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Frontend (Vite dev)",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "frontend", "run", "dev"],
+      "port": 5173
+    },
+    {
+      "name": "Backend (FastAPI/Uvicorn)",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-c", "cd /Users/christosskotanis/Downloads/nomos-one-ultimate-v3/backend && export JWT_SECRET=84acc08ccaf488331bd64c4f8d63f61d71346beb31bb3b4bcc20a7e101d58b86 DOCUMENT_STORAGE_PATH=/tmp/nomos-documents ADMIN_EMAIL=christos@skotanislaw.com ADMIN_NAME='Χρήστος Σκοτάνης' ADMIN_INITIAL_PASSWORD='Admin123@' CORS_ORIGINS='http://localhost:5173,http://localhost:3000' && uvicorn server:app --host 0.0.0.0 --port 8000"],
+      "port": 8000
+    },
+    {
+      "name": "Full Stack (Docker Compose)",
+      "runtimeExecutable": "docker",
+      "runtimeArgs": ["compose", "up"],
+      "port": 3000
+    }
+  ]
+}

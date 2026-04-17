@@ -1,0 +1,59 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Playfair+Display:wght@400;500;600;700&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body { @apply bg-[#071220] text-[#d4dce8] font-sans antialiased; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: #0B1C2D; }
+  ::-webkit-scrollbar-thumb { background: #1a3a5c; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #C6A75E; }
+}
+
+@layer components {
+  .glass-card {
+    @apply rounded-xl border border-[#1a3a5c]/50;
+    background: linear-gradient(135deg, rgba(19,43,69,0.8), rgba(11,28,45,0.9));
+    backdrop-filter: blur(10px);
+    box-shadow: 0 4px 24px rgba(0,0,0,0.3), inset 0 1px 0 rgba(198,167,94,0.05);
+  }
+  .glass-card-hover { @apply glass-card transition-all duration-300 cursor-pointer; }
+  .glass-card-hover:hover { border-color: rgba(198,167,94,0.3); box-shadow: 0 8px 32px rgba(0,0,0,0.4), inset 0 1px 0 rgba(198,167,94,0.1); }
+  .btn-gold { @apply px-4 py-2 rounded-lg font-medium text-sm transition-all duration-200; background: linear-gradient(135deg,#C6A75E,#B8993F); color: #071220; }
+  .btn-gold:hover { background: linear-gradient(135deg,#E8C97A,#C6A75E); box-shadow: 0 4px 16px rgba(198,167,94,0.3); }
+  .btn-gold:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-dark { @apply px-4 py-2 rounded-lg font-medium text-sm transition-all duration-200 border border-[#1a3a5c]; background: rgba(19,43,69,0.6); color: #d4dce8; }
+  .btn-dark:hover { border-color: #C6A75E; background: rgba(19,43,69,0.9); }
+  .input-dark { @apply w-full px-3 py-2 rounded-lg text-sm border border-[#1a3a5c] bg-[#0B1C2D] text-[#d4dce8] placeholder-[#5a7a9a] focus:outline-none focus:border-[#C6A75E] focus:ring-1 focus:ring-[#C6A75E]/30 transition-all duration-200; }
+  .table-premium thead th { @apply text-xs font-semibold uppercase tracking-wider text-[#8aa0b8] px-4 py-3 text-left border-b border-[#1a3a5c]/50; }
+  .table-premium tbody td { @apply px-4 py-3 text-sm text-[#c0d0e0] border-b border-[#132B45]/50; }
+  .table-premium tbody tr { @apply transition-colors duration-150; }
+  .table-premium tbody tr:hover { background: rgba(19,43,69,0.5); }
+  .status-badge { @apply px-2.5 py-0.5 rounded-full text-xs font-medium; }
+  .status-active { @apply status-badge bg-emerald-500/15 text-emerald-400 border border-emerald-500/20; }
+  .status-pending { @apply status-badge bg-amber-500/15 text-amber-400 border border-amber-500/20; }
+  .status-closed { @apply status-badge bg-slate-500/15 text-slate-400 border border-slate-500/20; }
+  .status-urgent { @apply status-badge bg-red-500/15 text-red-400 border border-red-500/20; }
+  .status-info { @apply status-badge bg-blue-500/15 text-blue-400 border border-blue-500/20; }
+  .page-title { @apply text-xl font-bold text-white; font-family: 'Playfair Display', serif; }
+  .page-subtitle { @apply text-xs text-[#6a8aaa]; }
+  .section-title { @apply text-sm font-semibold text-[#d4dce8] uppercase tracking-wider; }
+  .label { @apply block text-xs text-[#8aa0b8] mb-1.5 uppercase tracking-wider; }
+}
+
+/* ── Print styles: only the element with id="nomos-print-area" is printed ── */
+@media print {
+  body * { visibility: hidden !important; }
+  #nomos-print-area, #nomos-print-area * { visibility: visible !important; }
+  #nomos-print-area {
+    position: fixed !important;
+    inset: 0 !important;
+    z-index: 9999 !important;
+    background: white !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+  /* ensure dark backgrounds render in print */
+  * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+}
