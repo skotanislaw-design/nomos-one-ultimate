@@ -286,6 +286,26 @@ class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
 
+# ── Client Portal Models ──
+class PortalLoginRequest(BaseModel):
+    name: str
+    case_category: str
+    portal_code: str
+
+class PortalForgotPasswordRequest(BaseModel):
+    name: str
+    case_category: str
+
+class PortalMessageRequest(BaseModel):
+    content: str
+    subject: Optional[str] = None
+
+class PortalAccessRequest(BaseModel):
+    permissions: List[str] = Field(default_factory=lambda: [
+        'case_title', 'case_number', 'case_status', 'client_name',
+        'lawyer_name', 'lawyer_email', 'total_fees', 'outstanding_balance'
+    ])
+
 @app.post("/api/auth/login")
 async def login(req: LoginRequest):
     email = req.email.strip().lower()
@@ -440,6 +460,265 @@ async def reject_user(user_id: str, user=Depends(require_role(UserRole.ADMIN))):
         raise HTTPException(404, "Χρήστης δεν βρέθηκε")
     await audit("REJECT_USER", user["id"], "user", user_id)
     return {"ok": True, "message": "Χρήστης απορρίφθηκε"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLIENT PORTAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def create_portal_token(data: dict, expires_in_hours: int = 730) -> str:
+    """Create JWT token for portal access (30 days)"""
+    payload = {**data, "exp": datetime.utcnow() + timedelta(hours=expires_in_hours), "type": "portal"}
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+async def get_portal_user(credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False))) -> dict:
+    """Get portal user from JWT token"""
+    if not credentials:
+        raise HTTPException(401, "Δεν υπάρχει πρόσβαση")
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
+        if payload.get("type") != "portal":
+            raise HTTPException(401, "Μη έγκυρο token")
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Το token έχει λήξει")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Μη έγκυρο token")
+
+@app.post("/api/portal/auth")
+async def portal_login(req: PortalLoginRequest):
+    """Client portal authentication with name, category, and code"""
+    # Find case by client name, category, and portal code
+    portal_access = await db.portal_access.find_one({
+        "portal_code": req.portal_code.strip(),
+        "is_active": True
+    })
+    if not portal_access:
+        raise HTTPException(401, "Μη έγκυρος κωδικός πρόσβασης")
+
+    case = await db.cases.find_one({"_id": ObjectId(portal_access["case_id"])})
+    if not case or case.get("client_name", "").lower() != req.name.strip().lower():
+        raise HTTPException(401, "Μη συμφωνία στοιχείων")
+
+    # Update last accessed
+    await db.portal_access.update_one(
+        {"_id": portal_access["_id"]},
+        {"$set": {"accessed_at": datetime.utcnow()}}
+    )
+
+    token = create_portal_token({
+        "client_id": portal_access["client_id"],
+        "case_id": portal_access["case_id"],
+        "client_name": case.get("client_name"),
+        "permissions": portal_access.get("permissions", [])
+    })
+
+    await audit("PORTAL_LOGIN", str(portal_access["client_id"]), "portal", portal_access["case_id"])
+    return {"token": token, "client_name": case.get("client_name"), "case_title": case.get("title")}
+
+@app.post("/api/portal/forgot-password")
+async def portal_forgot_password(req: PortalForgotPasswordRequest):
+    """Client forgot password - notify admin"""
+    # Find client case
+    case = await db.cases.find_one({
+        "$and": [
+            {"client_name": {"$regex": f"^{re.escape(req.name)}$", "$options": "i"}},
+            {"category": req.case_category}
+        ]
+    })
+
+    if not case:
+        # Don't reveal if case exists
+        return {"message": "Αν η υπόθεση υπάρχει, ο διαχειριστής θα λάβει ειδοποίηση"}
+
+    # Create password reset request
+    reset_code = secrets.token_urlsafe(32)
+    await db.portal_reset_requests.insert_one({
+        "client_name": req.name,
+        "case_id": str(case["_id"]),
+        "reset_code": reset_code,
+        "created_at": datetime.utcnow(),
+        "expires_at": datetime.utcnow() + timedelta(hours=24),
+        "used": False
+    })
+
+    await audit("PORTAL_FORGOT_PASSWORD", str(case["_id"]), "portal", str(case["_id"]))
+    return {"message": "Αίτημα επαναφοράς κωδικού καταχωρήθηκε. Ο διαχειριστής θα επικοινωνήσει."}
+
+@app.get("/api/portal/my-case")
+async def portal_get_case(user=Depends(get_portal_user)):
+    """Get case data visible to client"""
+    try:
+        case = await db.cases.find_one({"_id": ObjectId(user["case_id"])})
+    except InvalidId:
+        raise HTTPException(404, "Υπόθεση δεν βρέθηκε")
+
+    if not case:
+        raise HTTPException(404, "Υπόθεση δεν βρέθηκε")
+
+    permissions = user.get("permissions", [])
+
+    # Filter case data by permissions
+    filtered_case = {
+        "id": str(case["_id"]),
+        "title": case.get("title") if "case_title" in permissions else "—",
+        "case_number": case.get("case_number") if "case_number" in permissions else "—",
+        "status": case.get("status") if "case_status" in permissions else "—",
+        "category": case.get("category") if "case_status" in permissions else "—",
+    }
+
+    # Add lawyer info if permitted
+    if "lawyer_name" in permissions:
+        lawyer = await db.users.find_one({"_id": ObjectId(case.get("assigned_lawyer_id", ""))})
+        filtered_case["lawyer_name"] = lawyer.get("name") if lawyer else "—"
+        filtered_case["lawyer_email"] = lawyer.get("email") if lawyer and "lawyer_email" in permissions else None
+
+    # Add financial info if permitted
+    if "total_fees" in permissions or "outstanding_balance" in permissions:
+        financials = await db.financials.find({"case_id": user["case_id"]}).to_list(None)
+        invoices = await db.invoices.find({"case_id": user["case_id"]}).to_list(None)
+        total_fees = sum(f.get("amount", 0) for f in financials if f.get("entry_type") == "fee")
+        total_paid = sum(i.get("amount_paid", 0) for i in invoices if i.get("payment_status") == "paid")
+        filtered_case["total_fees"] = total_fees if "total_fees" in permissions else None
+        filtered_case["outstanding_balance"] = (total_fees - total_paid) if "outstanding_balance" in permissions else None
+
+    return filtered_case
+
+@app.get("/api/portal/case-events")
+async def portal_get_events(user=Depends(get_portal_user)):
+    """Get case timeline events visible to client"""
+    # Get non-sensitive audit events
+    events = await db.audit_logs.find({
+        "$or": [
+            {"case_id": user["case_id"], "action": {"$in": ["CREATE_NOTE", "CREATE_DEADLINE", "UPDATE_STATUS", "CREATE_INVOICE"]}},
+            {"entity_id": user["case_id"]}
+        ]
+    }).sort("created_at", -1).to_list(None)
+
+    return [serialize(e) for e in events[:20]]
+
+@app.post("/api/portal/messages")
+async def portal_send_message(req: PortalMessageRequest, user=Depends(get_portal_user)):
+    """Client send message to lawyer and admin"""
+    case = await db.cases.find_one({"_id": ObjectId(user["case_id"])})
+    if not case:
+        raise HTTPException(404, "Υπόθεση δεν βρέθηκε")
+
+    message = {
+        "case_id": user["case_id"],
+        "client_name": user.get("client_name"),
+        "content": sanitize_string(req.content),
+        "subject": req.subject or "Μήνυμα από πελάτη",
+        "created_at": datetime.utcnow(),
+        "read": False
+    }
+
+    result = await db.portal_messages.insert_one(message)
+
+    # Notify lawyer and admin
+    lawyer_id = case.get("assigned_lawyer_id")
+    if lawyer_id:
+        # TODO: Send native notification to lawyer
+        pass
+
+    # TODO: Send email to lawyer and admin
+
+    await audit("PORTAL_MESSAGE", user.get("client_id", ""), "portal", str(result.inserted_id))
+    return {"ok": True, "message_id": str(result.inserted_id)}
+
+@app.post("/api/portal/upload")
+async def portal_upload_document(file: UploadFile = File(...), user=Depends(get_portal_user)):
+    """Client upload document"""
+    if not file.filename:
+        raise HTTPException(400, "Δεν υπάρχει αρχείο")
+
+    # Save document
+    doc_id = str(ObjectId())
+    case_id = user["case_id"]
+    doc_dir = Path(f"documents/{case_id}")
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    file_path = doc_dir / f"{doc_id}_{file.filename}"
+
+    with open(file_path, "wb") as f:
+        f.write(await file.read())
+
+    # Store in database
+    doc = {
+        "case_id": case_id,
+        "filename": file.filename,
+        "file_path": str(file_path),
+        "uploaded_by": "portal_client",
+        "uploaded_by_name": user.get("client_name"),
+        "created_at": datetime.utcnow(),
+        "size": file.size
+    }
+
+    result = await db.documents.insert_one(doc)
+
+    # Notify lawyer
+    case = await db.cases.find_one({"_id": ObjectId(case_id)})
+    lawyer_id = case.get("assigned_lawyer_id")
+    if lawyer_id:
+        # TODO: Send native notification: "Client uploaded document: {filename}"
+        pass
+
+    await audit("PORTAL_UPLOAD", user.get("client_id", ""), "document", str(result.inserted_id))
+    return {"ok": True, "document_id": str(result.inserted_id), "filename": file.filename}
+
+# ── Admin Portal Management ──
+@app.post("/api/admin/clients/{client_id}/generate-portal-access")
+async def generate_portal_access(client_id: str, req: PortalAccessRequest, user=Depends(require_role(UserRole.ADMIN))):
+    """Generate portal access code for client"""
+    # Find client and their active cases
+    try:
+        client_oid = ObjectId(client_id)
+    except InvalidId:
+        raise HTTPException(400, "Μη έγκυρο client ID")
+
+    cases = await db.cases.find({"client_id": client_id, "status": {"$in": ["active", "pending"]}}).to_list(None)
+    if not cases:
+        raise HTTPException(404, "Δεν υπάρχουν ενεργές υποθέσεις")
+
+    # Create portal access for first case
+    case = cases[0]
+    portal_code = secrets.token_urlsafe(12)
+
+    access_record = {
+        "client_id": client_id,
+        "case_id": str(case["_id"]),
+        "portal_code": portal_code,
+        "permissions": req.permissions,
+        "is_active": True,
+        "created_at": datetime.utcnow(),
+        "created_by": user["id"]
+    }
+
+    result = await db.portal_access.insert_one(access_record)
+
+    # TODO: Send email to client with portal_code and link
+
+    await audit("CREATE_PORTAL_ACCESS", user["id"], "portal", str(result.inserted_id))
+    return {
+        "ok": True,
+        "portal_code": portal_code,
+        "case_id": str(case["_id"]),
+        "case_title": case.get("title"),
+        "message": "Portal code generated and email sent to client"
+    }
+
+@app.patch("/api/admin/cases/{case_id}/portal-permissions")
+async def update_portal_permissions(case_id: str, req: PortalAccessRequest, user=Depends(require_role(UserRole.ADMIN))):
+    """Update what fields client can see"""
+    portal_access = await db.portal_access.find_one({"case_id": case_id})
+    if not portal_access:
+        raise HTTPException(404, "Portal access not found for this case")
+
+    await db.portal_access.update_one(
+        {"_id": portal_access["_id"]},
+        {"$set": {"permissions": req.permissions, "updated_at": datetime.utcnow()}}
+    )
+
+    await audit("UPDATE_PORTAL_PERMISSIONS", user["id"], "portal", case_id)
+    return {"ok": True, "message": "Portal permissions updated"}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CLIENTS
