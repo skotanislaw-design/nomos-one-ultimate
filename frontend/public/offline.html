@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="el">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Offline — Nomos One</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(180deg, #071220 0%, #0a1929 50%, #071220 100%);
+            color: #d4dce8;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 600px;
+            width: 100%;
+            text-align: center;
+            background: linear-gradient(135deg, rgba(26, 58, 92, 0.5), rgba(15, 86, 179, 0.1));
+            border: 1px solid rgba(198, 167, 94, 0.2);
+            border-radius: 16px;
+            padding: 60px 40px;
+            backdrop-filter: blur(10px);
+        }
+
+        .icon {
+            font-size: 64px;
+            margin-bottom: 30px;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                opacity: 1;
+            }
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        h1 {
+            font-size: 32px;
+            font-weight: 600;
+            margin-bottom: 15px;
+            color: #ffffff;
+        }
+
+        p {
+            font-size: 16px;
+            color: #a0b9d4;
+            margin-bottom: 30px;
+            line-height: 1.6;
+        }
+
+        .status-box {
+            background: rgba(198, 167, 94, 0.05);
+            border: 1px solid rgba(198, 167, 94, 0.2);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 30px;
+            text-align: left;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 12px;
+            font-size: 14px;
+        }
+
+        .status-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .status-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            margin-right: 12px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .status-icon.yes {
+            background: rgba(76, 175, 80, 0.2);
+            color: #4caf50;
+        }
+
+        .status-icon.no {
+            background: rgba(244, 67, 54, 0.2);
+            color: #f44336;
+        }
+
+        .tips {
+            text-align: left;
+            background: rgba(15, 86, 179, 0.05);
+            border: 1px solid rgba(15, 86, 179, 0.2);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+
+        .tips h3 {
+            font-size: 14px;
+            font-weight: 600;
+            color: #0f56b3;
+            margin-bottom: 12px;
+        }
+
+        .tips ul {
+            list-style: none;
+            padding: 0;
+        }
+
+        .tips li {
+            font-size: 14px;
+            color: #a0b9d4;
+            margin-bottom: 8px;
+            padding-left: 20px;
+            position: relative;
+        }
+
+        .tips li:before {
+            content: "✓";
+            position: absolute;
+            left: 0;
+            color: #0f56b3;
+            font-weight: bold;
+        }
+
+        .action-button {
+            background: linear-gradient(135deg, #0f56b3, #0d4699);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 12px 30px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 20px;
+        }
+
+        .action-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 16px rgba(15, 86, 179, 0.3);
+        }
+
+        .action-button:active {
+            transform: translateY(0);
+        }
+
+        .loading {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #0f56b3;
+            animation: blink 1.5s infinite;
+            margin-left: 5px;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 0.3; }
+            50% { opacity: 1; }
+        }
+
+        @media (max-width: 600px) {
+            .container {
+                padding: 40px 25px;
+            }
+
+            h1 {
+                font-size: 24px;
+            }
+
+            p {
+                font-size: 14px;
+            }
+
+            .status-box,
+            .tips {
+                padding: 16px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">📡</div>
+
+        <h1>Σας Λείπει η Σύνδεση</h1>
+
+        <p>
+            Δεν είστε συνδεδεμένοι στο διαδίκτυο. Δουλεύουμε για να επαναφέρουμε τη σύνδεσή σας.
+        </p>
+
+        <div class="status-box">
+            <div class="status-item">
+                <div class="status-icon no">✕</div>
+                <span>Σύνδεση Διαδικτύου</span>
+            </div>
+            <div class="status-item">
+                <div class="status-icon yes">✓</div>
+                <span>Τοπικά Δεδομένα (Διαθέσιμα Χωρίς Σύνδεση)</span>
+            </div>
+            <div class="status-item">
+                <div class="status-icon yes">✓</div>
+                <span>Εφαρμογή Nomos One</span>
+            </div>
+        </div>
+
+        <div class="tips">
+            <h3>Τι μπορείτε να κάνετε:</h3>
+            <ul>
+                <li>Προβολή αποθηκευμένων υποθέσεων και πελατών</li>
+                <li>Ανάγνωση προηγούμενων μηνυμάτων και σημειώσεων</li>
+                <li>Πρόσχεδιο νέων ενεργειών για αργότερο</li>
+                <li>Χρήση της εφαρμογής κανονικά μόλις επανέλθετε online</li>
+            </ul>
+        </div>
+
+        <div class="tips" style="background: rgba(244, 67, 54, 0.05); border-color: rgba(244, 67, 54, 0.2);">
+            <h3 style="color: #d32f2f;">Συμβουλές:</h3>
+            <ul>
+                <li>Ελέγξτε τη σύνδεση Wi-Fi ή τα δεδομένα κινητού σας</li>
+                <li>Δοκιμάστε να επανεκκινήσετε τον δρομολογητή σας</li>
+                <li>Αν το πρόβλημα παραμένει, επικοινωνήστε με τον ISP σας</li>
+            </ul>
+        </div>
+
+        <button class="action-button" onclick="location.reload()">
+            Δοκιμάστε Ξανά
+            <span class="loading"></span>
+        </button>
+
+        <p style="font-size: 12px; color: #5a7a9a; margin-top: 20px;">
+            Η σελίδα θα ενημερωθεί αυτόματα όταν επανέλθετε online
+        </p>
+    </div>
+
+    <script>
+        // Auto-refresh when going online
+        window.addEventListener('online', () => {
+            console.log('[Offline] Connection restored, refreshing...');
+            setTimeout(() => {
+                location.reload();
+            }, 1000);
+        });
+
+        // Update UI when connection changes
+        window.addEventListener('offline', () => {
+            console.log('[Offline] Lost connection');
+        });
+    </script>
+</body>
+</html>

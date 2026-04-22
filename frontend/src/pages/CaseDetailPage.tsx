@@ -8,6 +8,7 @@ import {
 import { casesApi, hearingsApi, paymentsApi, invoicingApi, exportApi, emailApi } from '@/lib/api';
 import { SegmentTabs } from '@/components/ui/SegmentTabs';
 import { usePermissions } from '@/hooks/usePermissions';
+import { useWebSocketContext } from '@/contexts/WebSocketContext';
 import { toast } from 'sonner';
 
 type DetailTab = 'overview' | 'hearings' | 'payments' | 'documents' | 'notes';
@@ -28,6 +29,7 @@ const HEARING_STATUS_LABELS: Record<string, string> = {
 export default function CaseDetailPage() {
   const { id } = useParams<{ id: string }>();
   const perms = usePermissions();
+  const ws = useWebSocketContext(); // WebSocket context για real-time updates
 
   const [c, setCase] = useState<any>(null);
   const [notes, setNotes] = useState<any[]>([]);
@@ -41,6 +43,7 @@ export default function CaseDetailPage() {
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<DetailTab>('overview');
   const [newNote, setNewNote] = useState('');
+  const [isSynced, setIsSynced] = useState(false); // Δείχνει αν τα δεδομένα είναι συγχρονισμένα
 
   // Hearing form
   const [showHearingForm, setShowHearingForm] = useState(false);
@@ -83,6 +86,53 @@ export default function CaseDetailPage() {
   };
 
   useEffect(() => { load(); }, [id]);
+
+  // ========== WebSocket Real-time Updates ==========
+  useEffect(() => {
+    if (!id || !ws.isConnected) return;
+
+    // Κάνε join στο room για αυτή την υπόθεση
+    ws.joinRoom(id);
+
+    // Ακούγε για ενημερώσεις της υπόθεσης
+    const unsubCase = ws.on('case.updated', (event) => {
+      if (event.case_id === id) {
+        setCase(prev => ({ ...prev, ...event.data }));
+        setIsSynced(true);
+        setTimeout(() => setIsSynced(false), 2000); // Δείχνει ένδειξη 2 δευτ.
+      }
+    });
+
+    // Ακούγε για νέες σημειώσεις
+    const unsubNote = ws.on('note.created', (event) => {
+      if (event.case_id === id) {
+        setNotes(prev => [event.data, ...prev]);
+      }
+    });
+
+    // Ακούγε για νέα έγγραφα
+    const unsubDoc = ws.on('document.uploaded', (event) => {
+      if (event.case_id === id) {
+        setDocs(prev => [event.data, ...prev]);
+      }
+    });
+
+    // Ακούγε για νέα ακροαματήρια
+    const unsubHearing = ws.on('hearing.created', (event) => {
+      if (event.case_id === id) {
+        setHearings(prev => [event.data, ...prev]);
+      }
+    });
+
+    return () => {
+      // Αποσύνδεση όταν φεύγουμε από τη σελίδα
+      ws.leaveRoom(id);
+      unsubCase();
+      unsubNote();
+      unsubDoc();
+      unsubHearing();
+    };
+  }, [id, ws.isConnected, ws]);
 
   const fmt = (n: number) => `€${Number(n || 0).toLocaleString('el-GR', { minimumFractionDigits: 2 })}`;
 
