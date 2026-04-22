@@ -9,6 +9,10 @@ import {
 import { useAuth } from '@/contexts/AuthContext';
 import { usePermissions } from '@/hooks/usePermissions';
 
+// PWA Components
+import PWAInstallPrompt from '@/components/mobile/PWAInstallPrompt';
+import OfflineIndicator from '@/components/mobile/OfflineIndicator';
+
 // Pages
 import Dashboard from '@/pages/Dashboard';
 import ClientsPage from '@/pages/ClientsPage';
@@ -130,6 +134,10 @@ export default function AppShell() {
 
   return (
     <div className="min-h-screen" style={{ background: 'linear-gradient(180deg,#071220 0%,#0a1929 40%,#071220 100%)' }}>
+      {/* PWA Indicators */}
+      <OfflineIndicator />
+      <PWAInstallPrompt />
+
       {/* Mobile overlay */}
       {mobileOpen && <div className="fixed inset-0 bg-black/60 z-40 lg:hidden" onClick={() => setMobileOpen(false)} />}
 

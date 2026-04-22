@@ -587,3 +587,352 @@ async def send_password_reset_email(
         text_content=text,
         reply_to=None
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 2FA Email Functions (Phase 1.6)
+# ═══════════════════════════════════════════════════════════════
+
+def create_otp_email(
+    user_name: str,
+    otp_code: str,
+    expires_minutes: int = 10
+) -> tuple[str, str]:
+    """Generate OTP code email for 2FA login"""
+
+    otp_display = " ".join(otp_code[i:i+3] for i in range(0, len(otp_code), 3))
+
+    html = f"""
+    <html dir="rtl">
+    <head>
+        <meta charset="utf-8">
+        <style>
+            body {{ font-family: Arial, sans-serif; direction: rtl; }}
+            .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+            .header {{ background-color: #C6A75E; padding: 20px; text-align: center; }}
+            .header h1 {{ color: #071220; margin: 0; }}
+            .content {{ background-color: #f5f5f5; padding: 20px; }}
+            .otp-box {{
+                background-color: #071220;
+                color: #C6A75E;
+                padding: 20px;
+                text-align: center;
+                border-radius: 5px;
+                font-size: 28px;
+                font-weight: bold;
+                font-family: monospace;
+                margin: 20px 0;
+                letter-spacing: 4px;
+            }}
+            .warning {{
+                background-color: #fce5cd;
+                border-right: 4px solid #d33b27;
+                padding: 15px;
+                margin: 20px 0;
+                border-radius: 4px;
+                color: #5f6368;
+            }}
+            .footer {{ color: #666; font-size: 12px; text-align: center; margin-top: 20px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>Σύνδεση Δύο Παραγόντων</h1>
+            </div>
+
+            <div class="content">
+                <p>Καλησπέρα {user_name},</p>
+
+                <p>Ζητήσατε είσοδο στο Nomos One χρησιμοποιώντας δύο παράγοντες επαλήθευσης.</p>
+
+                <p>Χρησιμοποιήστε τον ακόλουθο κωδικό για να ολοκληρώσετε τη σύνδεση:</p>
+
+                <div class="otp-box">{otp_display}</div>
+
+                <p style="color: #d33b27; font-weight: bold;">
+                    ⏱️ Ο κωδικός λήγει σε {expires_minutes} λεπτά
+                </p>
+
+                <div class="warning">
+                    <strong>🔒 Ασφάλεια:</strong><br>
+                    Ποτέ δε θα σας ζητήσουμε αυτόν τον κωδικό μέσω κάποιας άλλης επικοινωνίας.
+                    Αν δεν ζητήσατε αυτή τη σύνδεση, παρακαλώ αγνοήστε αυτό το email.
+                </div>
+
+                <p>Σκοτάνης & Συνεργάτες</p>
+            </div>
+
+            <div class="footer">
+                <p>© 2026 Σκοτάνης & Συνεργάτες - Εμπιστευτική Πλατφόρμα Νομικών Λειτουργιών</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+    text = f"""
+    Σύνδεση Δύο Παραγόντων - Nomos One
+
+    Καλησπέρα {user_name},
+
+    Ζητήσατε είσοδο στο Nomos One χρησιμοποιώντας δύο παράγοντες επαλήθευσης.
+
+    ΚΩΔΙΚΟΣ ΕΠΑΛΗΘΕΥΣΗΣ: {otp_display}
+
+    ⏱️ Ο κωδικός λήγει σε {expires_minutes} λεπτά
+
+    ΣΗΜΑΝΤΙΚΟ:
+    Ποτέ δε θα σας ζητήσουμε αυτόν τον κωδικό μέσω κάποιας άλλης επικοινωνίας.
+    Αν δεν ζητήσατε αυτή τη σύνδεση, παρακαλώ αγνοήστε αυτό το email.
+
+    Σκοτάνης & Συνεργάτες
+    © 2026 Σκοτάνης & Συνεργάτες
+    """
+
+    return html.strip(), text.strip()
+
+
+def create_2fa_setup_email(user_name: str) -> tuple[str, str]:
+    """Generate 2FA setup confirmation email"""
+
+    html = f"""
+    <html dir="rtl">
+    <head>
+        <meta charset="utf-8">
+        <style>
+            body {{ font-family: Arial, sans-serif; direction: rtl; }}
+            .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+            .header {{ background-color: #C6A75E; padding: 20px; text-align: center; }}
+            .header h1 {{ color: #071220; margin: 0; }}
+            .success-box {{
+                background-color: #e6f4ea;
+                border-right: 4px solid #137333;
+                padding: 15px;
+                border-radius: 4px;
+                margin: 20px 0;
+                color: #137333;
+            }}
+            .footer {{ color: #666; font-size: 12px; text-align: center; margin-top: 20px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>Ενεργοποίηση Δύο Παραγόντων</h1>
+            </div>
+
+            <p>Καλησπέρα {user_name},</p>
+
+            <p>Ευχαριστούμε που ενεργοποιήσατε τη δύο παράγοντα επαλήθευση στο Nomos One.</p>
+
+            <div class="success-box">
+                <strong>✓ Επιτυχία!</strong><br>
+                Ο λογαριασμός σας είναι τώρα πιο ασφαλής. Από τώρα και στο εξής,
+                θα πρέπει να παρέχετε πρόσθετη επαλήθευση κατά τη σύνδεση.
+            </div>
+
+            <h3>Τι συνέβη:</h3>
+            <ul>
+                <li>✓ Ενεργοποιήσατε τη δύο παράγοντα επαλήθευση</li>
+                <li>✓ Λάβατε 10 κωδικούς ανάκτησης</li>
+                <li>✓ Σώστε τους κωδικούς σε ασφαλές μέρος</li>
+            </ul>
+
+            <h3>Επόμενα βήματα:</h3>
+            <ol>
+                <li>Συνδεθείτε στο Nomos One με τα στοιχεία σας</li>
+                <li>Σε επόμενες συνδέσεις, θα σας ζητηθεί κωδικός</li>
+                <li>Μπορείτε να ενεργοποιήσετε "Εμπιστοσύνη συσκευής" για 30 ημέρες</li>
+            </ol>
+
+            <p>Σκοτάνης & Συνεργάτες</p>
+
+            <div class="footer">
+                <p>© 2026 Σκοτάνης & Συνεργάτες - Εμπιστευτική Πλατφόρμα Νομικών Λειτουργιών</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+    text = f"""
+    Ενεργοποίηση Δύο Παραγόντων - Nomos One
+
+    Καλησπέρα {user_name},
+
+    Ευχαριστούμε που ενεργοποιήσατε τη δύο παράγοντα επαλήθευση.
+
+    ✓ Ο λογαριασμός σας είναι τώρα πιο ασφαλής.
+
+    ΤΙ ΣΥΝΕΒΗ:
+    - Ενεργοποιήσατε τη δύο παράγοντα επαλήθευση
+    - Λάβατε 10 κωδικούς ανάκτησης
+    - Σώστε τους κωδικούς σε ασφαλές μέρος
+
+    ΕΠΟΜΕΝΑ ΒΗΜΑΤΑ:
+    1. Συνδεθείτε στο Nomos One
+    2. Σε επόμενες συνδέσεις, θα σας ζητηθεί κωδικός
+    3. Μπορείτε να ενεργοποιήσετε "Εμπιστοσύνη συσκευής" για 30 ημέρες
+
+    Σκοτάνης & Συνεργάτες
+    © 2026 Σκοτάνης & Συνεργάτες
+    """
+
+    return html.strip(), text.strip()
+
+
+def create_backup_codes_email(user_name: str, codes: List[str]) -> tuple[str, str]:
+    """Generate backup codes email"""
+
+    codes_html = "".join(
+        f"<li style='font-family: monospace; font-size: 14px; margin: 5px 0; direction: ltr;'>{code}</li>"
+        for code in codes
+    )
+
+    html = f"""
+    <html dir="rtl">
+    <head>
+        <meta charset="utf-8">
+        <style>
+            body {{ font-family: Arial, sans-serif; direction: rtl; }}
+            .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+            .header {{ background-color: #C6A75E; padding: 20px; text-align: center; }}
+            .header h1 {{ color: #071220; margin: 0; }}
+            .warning {{
+                background-color: #fce5cd;
+                border-right: 4px solid #d33b27;
+                padding: 15px;
+                margin: 20px 0;
+                border-radius: 4px;
+                color: #5f6368;
+            }}
+            .codes-box {{
+                background-color: #f8f9fa;
+                border: 1px solid #dadce0;
+                border-radius: 4px;
+                padding: 20px;
+                margin: 20px 0;
+            }}
+            .codes-list {{
+                list-style: none;
+                padding: 0;
+                margin: 0;
+                direction: ltr;
+                text-align: left;
+            }}
+            .footer {{ color: #666; font-size: 12px; text-align: center; margin-top: 20px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>Κωδικοί Ανάκτησης</h1>
+            </div>
+
+            <p>Καλησπέρα {user_name},</p>
+
+            <p>Εδώ είναι οι κωδικοί ανάκτησης για το λογαριασμό σας:</p>
+
+            <div class="codes-box">
+                <ul class="codes-list">
+                    {codes_html}
+                </ul>
+            </div>
+
+            <div class="warning">
+                <strong>⚠️ Σημαντικό:</strong>
+                <ul style="margin: 10px 0; padding-right: 20px;">
+                    <li>Σώστε τους κωδικούς σε ασφαλές μέρος (αποθηκευμένο έγγραφο, σεντούκι)</li>
+                    <li>Κάθε κωδικός μπορεί να χρησιμοποιηθεί ΜΟΝΟ μία φορά</li>
+                    <li>Αν χάσετε τη συσκευή σας, χρησιμοποιήστε έναν κωδικό για πρόσβαση</li>
+                    <li>Μη μοιράζεστε τους κωδικούς με κανέναν</li>
+                </ul>
+            </div>
+
+            <p><strong>Σημείωση:</strong> Αν ζητήσατε νέα σετ κωδικών, οι παλιοί κωδικοί δεν θα λειτουργήσουν.</p>
+
+            <p>Σκοτάνης & Συνεργάτες</p>
+
+            <div class="footer">
+                <p>© 2026 Σκοτάνης & Συνεργάτες - Εμπιστευτική Πλατφόρμα Νομικών Λειτουργιών</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+    text = f"""
+    Κωδικοί Ανάκτησης - Nomos One
+
+    Καλησπέρα {user_name},
+
+    Εδώ είναι οι κωδικοί ανάκτησης για το λογαριασμό σας:
+
+    {''.join(f'{code}\n' for code in codes)}
+
+    ⚠️ ΣΗΜΑΝΤΙΚΟ:
+    - Σώστε τους κωδικούς σε ασφαλές μέρος
+    - Κάθε κωδικός μπορεί να χρησιμοποιηθεί ΜΟΝΟ μία φορά
+    - Αν χάσετε τη συσκευή σας, χρησιμοποιήστε έναν κωδικό
+    - Μη μοιράζεστε τους κωδικούς με κανέναν
+
+    Σκοτάνης & Συνεργάτες
+    © 2026 Σκοτάνης & Συνεργάτες
+    """
+
+    return html.strip(), text.strip()
+
+
+async def send_otp_email(
+    user_email: str,
+    user_name: str,
+    otp_code: str,
+    expires_minutes: int = 10
+) -> bool:
+    """Send OTP code for 2FA login"""
+    html, text = create_otp_email(user_name, otp_code, expires_minutes)
+
+    return await send_email_async(
+        to_email=user_email,
+        to_name=user_name,
+        subject=f"[Nomos One] Κωδικός Σύνδεσης: {otp_code[:3]}***",
+        html_content=html,
+        text_content=text,
+        reply_to=None
+    )
+
+
+async def send_2fa_setup_email(
+    user_email: str,
+    user_name: str
+) -> bool:
+    """Send 2FA setup confirmation email"""
+    html, text = create_2fa_setup_email(user_name)
+
+    return await send_email_async(
+        to_email=user_email,
+        to_name=user_name,
+        subject="[Nomos One] Δύο Παράγοντες Επαλήθευση Ενεργοποιημένη",
+        html_content=html,
+        text_content=text,
+        reply_to=None
+    )
+
+
+async def send_backup_codes_email(
+    user_email: str,
+    user_name: str,
+    codes: List[str]
+) -> bool:
+    """Send backup codes email"""
+    html, text = create_backup_codes_email(user_name, codes)
+
+    return await send_email_async(
+        to_email=user_email,
+        to_name=user_name,
+        subject="[Nomos One] Κωδικοί Ανάκτησης",
+        html_content=html,
+        text_content=text,
+        reply_to=None
+    )
