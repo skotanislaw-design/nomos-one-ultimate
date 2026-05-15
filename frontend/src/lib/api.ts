@@ -306,6 +306,10 @@ export const adminPortalApi = {
   // Reject password reset request
   rejectResetRequest: (request_id: string) =>
     api.post(`/api/admin/portal-reset-requests/${request_id}/reject`),
+
+  // Delete a portal access code
+  deletePortalAccess: (code_id: string) =>
+    api.delete(`/api/admin/portal-access/${code_id}`),
 };
 
 export default api;

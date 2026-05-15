@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Plus, Copy, CheckCircle, XCircle, AlertCircle, Loader2, Eye, EyeOff, Trash2 } from 'lucide-react';
-import { casesApi } from '@/lib/api';
+import { casesApi, adminPortalApi } from '@/lib/api';
 import { usePermissions } from '@/hooks/usePermissions';
 import { toast } from 'sonner';
 
@@ -58,12 +58,14 @@ export default function AdminPortalPage() {
     const loadData = async () => {
       setLoading(true);
       try {
-        const [casesRes] = await Promise.all([
+        const [casesRes, codesRes, resetRes] = await Promise.all([
           casesApi.list().catch(() => ({ data: [] })),
-          // TODO: Load access codes from API
-          // TODO: Load reset requests from API
+          adminPortalApi.listPortalAccess().catch(() => ({ data: [] })),
+          adminPortalApi.listResetRequests().catch(() => ({ data: [] })),
         ]);
         setCases(casesRes.data || []);
+        setAccessCodes(codesRes.data || []);
+        setResetRequests(resetRes.data || []);
       } catch (err) {
         console.error('Error loading admin data:', err);
         toast.error('Σφάλμα φόρτωσης δεδομένων');
@@ -87,28 +89,21 @@ export default function AdminPortalPage() {
 
     setGenerating(true);
     try {
-      // TODO: Call API to generate portal access code
-      // const response = await adminPortalApi.generatePortalAccess(clientId, selectedCase, selectedPermissions);
-
-      // Mock response for now
-      const mockCode = `${Math.random().toString(36).substring(2, 8).toUpperCase()}${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
-
-      const newAccess: PortalAccessCode = {
-        _id: Math.random().toString(),
-        case_id: selectedCase,
-        client_id: '',
-        portal_code: mockCode,
-        permissions: selectedPermissions,
-        is_active: true,
-        created_at: new Date().toISOString(),
-      };
-
-      setAccessCodes([...accessCodes, newAccess]);
-      toast.success(`Κωδικός δημιουργήθηκε: ${mockCode}`);
-      setSelectedCase('');
+      const selectedCaseObj = cases.find(c => c._id === selectedCase);
+      if (!selectedCaseObj?.client_id) {
+        toast.error('Η υπόθεση δεν έχει συνδεδεμένο πελάτη');
+        setGenerating(false);
+        return;
+      }
+      const response = await adminPortalApi.generatePortalAccess(selectedCaseObj.client_id, selectedCase, selectedPermissions);
+      const newCode = response.data.portal_code;
+      toast.success(`Κωδικός δημιουργήθηκε: ${newCode}`);
+      const codesRes = await adminPortalApi.listPortalAccess().catch(() => ({ data: [] }));
+      setAccessCodes(codesRes.data || []);
+      setSelectedCase();
       setSelectedPermissions([
-        'case_title', 'case_number', 'case_status', 'lawyer_name', 'lawyer_email',
-        'total_fees', 'outstanding_balance'
+        case_title, case_number, case_status, lawyer_name, lawyer_email,
+        total_fees, outstanding_balance
       ]);
     } catch (err: any) {
       toast.error(err.response?.data?.detail || 'Σφάλμα δημιουργίας κωδικού');
@@ -127,10 +122,12 @@ export default function AdminPortalPage() {
   const handleApproveReset = async (id: string) => {
     setApprovingId(id);
     try {
-      // TODO: Call API to approve reset request
-      // await adminPortalApi.approveResetRequest(id);
-      toast.success('Αίτηση εγκρίθηκε');
+      const res = await adminPortalApi.approveResetRequest(id);
+      const newCode = res.data.new_portal_code;
+      toast.success();
       setResetRequests(resetRequests.filter(r => r._id !== id));
+      const codesRes = await adminPortalApi.listPortalAccess().catch(() => ({ data: [] }));
+      setAccessCodes(codesRes.data || []);
     } catch (err: any) {
       toast.error(err.response?.data?.detail || 'Σφάλμα');
     } finally {
@@ -141,8 +138,7 @@ export default function AdminPortalPage() {
   const handleRejectReset = async (id: string) => {
     setRejectingId(id);
     try {
-      // TODO: Call API to reject reset request
-      // await adminPortalApi.rejectResetRequest(id);
+      await adminPortalApi.rejectResetRequest(id);
       toast.success('Αίτηση απορρίφθηκε');
       setResetRequests(resetRequests.filter(r => r._id !== id));
     } catch (err: any) {
@@ -283,9 +279,14 @@ export default function AdminPortalPage() {
                     </td>
                     <td>
                       <button
-                        onClick={() => {
-                          setAccessCodes(accessCodes.filter(c => c._id !== code._id));
-                          toast.success('Κωδικός διαγράφηκε');
+                        onClick={async () => {
+                          try {
+                            await adminPortalApi.deletePortalAccess(code._id);
+                            setAccessCodes(accessCodes.filter(c => c._id !== code._id));
+                            toast.success('Κωδικός διαγράφηκε');
+                          } catch {
+                            toast.error('Σφάλμα διαγραφής');
+                          }
                         }}
                         className="p-1.5 rounded hover:bg-[#132B45] text-[#7a9ab8] hover:text-red-400 transition-colors"
                         title="Διαγραφή"

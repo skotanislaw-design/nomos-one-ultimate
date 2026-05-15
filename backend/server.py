@@ -753,6 +753,65 @@ async def update_portal_permissions(case_id: str, req: PortalAccessRequest, user
     await audit("UPDATE_PORTAL_PERMISSIONS", user["id"], "portal", case_id)
     return {"ok": True, "message": "Portal permissions updated"}
 
+@app.get("/api/admin/portal-access")
+async def list_portal_access(user=Depends(require_role(UserRole.ADMIN))):
+    """List all portal access codes"""
+    codes = await db.portal_access.find().sort("created_at", -1).to_list(None)
+    return [serialize(c) for c in codes]
+
+@app.delete("/api/admin/portal-access/{code_id}")
+async def delete_portal_access(code_id: str, user=Depends(require_role(UserRole.ADMIN))):
+    """Delete a portal access code"""
+    result = await db.portal_access.delete_one({"_id": make_id(code_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Portal access not found")
+    await audit("DELETE_PORTAL_ACCESS", user["id"], "portal", code_id)
+    return {"ok": True}
+
+@app.get("/api/admin/portal-reset-requests")
+async def list_portal_reset_requests(user=Depends(require_role(UserRole.ADMIN))):
+    """List all portal password reset requests"""
+    requests = await db.portal_reset_requests.find({"used": False}).sort("created_at", -1).to_list(None)
+    return [serialize(r) for r in requests]
+
+@app.post("/api/admin/portal-reset-requests/{request_id}/approve")
+async def approve_portal_reset(request_id: str, user=Depends(require_role(UserRole.ADMIN))):
+    """Approve reset: generate new portal code and notify client"""
+    req = await db.portal_reset_requests.find_one({"_id": make_id(request_id)})
+    if not req:
+        raise HTTPException(404, "Request not found")
+
+    case_id = req.get("case_id")
+    portal_access = await db.portal_access.find_one({"case_id": case_id})
+    if not portal_access:
+        raise HTTPException(404, "Portal access not found for this case")
+
+    new_code = secrets.token_urlsafe(12)
+    await db.portal_access.update_one(
+        {"_id": portal_access["_id"]},
+        {"$set": {"portal_code": new_code, "updated_at": datetime.utcnow()}}
+    )
+    await db.portal_reset_requests.update_one(
+        {"_id": make_id(request_id)},
+        {"$set": {"used": True, "resolved_at": datetime.utcnow(), "resolved_by": user["id"]}}
+    )
+    await audit("APPROVE_PORTAL_RESET", user["id"], "portal", case_id)
+    return {"ok": True, "new_portal_code": new_code}
+
+@app.post("/api/admin/portal-reset-requests/{request_id}/reject")
+async def reject_portal_reset(request_id: str, user=Depends(require_role(UserRole.ADMIN))):
+    """Reject a portal password reset request"""
+    result = await db.portal_reset_requests.update_one(
+        {"_id": make_id(request_id)},
+        {"$set": {"used": True, "resolved_at": datetime.utcnow(), "resolved_by": user["id"], "rejected": True}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(404, "Request not found")
+    await audit("REJECT_PORTAL_RESET", user["id"], "portal", request_id)
+    return {"ok": True}
+
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CLIENTS
 # ══════════════════════════════════════════════════════════════════════════════

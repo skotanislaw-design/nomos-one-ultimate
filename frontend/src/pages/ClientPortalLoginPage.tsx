@@ -41,8 +41,7 @@ export default function ClientPortalLoginPage() {
     }
     setForgotLoading(true);
     try {
-      // TODO: Call portal forgot password endpoint
-      // await portalApi.forgotPassword(forgotName, forgotCategory);
+      await portalApi.forgotPassword(forgotName, forgotCategory);
       toast.success('Ελέγξτε το email σας για συνδέσμου επαναφοράς');
       setShowForgotPassword(false);
       setForgotName('');
