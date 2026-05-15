@@ -354,6 +354,55 @@ async def login(req: LoginRequest):
 async def me(user=Depends(get_current_user)):
     u = dict(user); u.pop("password", None); return u
 
+@app.post("/api/auth/verify-password")
+async def verify_current_password(req: ChangePasswordRequest, user=Depends(get_current_user)):
+    full_user = await db.users.find_one({"_id": make_id(user["id"])})
+    if not full_user or not verify_password(req.current_password, full_user["password"]):
+        raise HTTPException(401, "Λάθος κωδικός")
+    return {"ok": True}
+
+@app.get("/api/notifications")
+async def get_notifications(user=Depends(get_current_user)):
+    now = datetime.utcnow()
+    notifications = []
+
+    inv_query = {"payment_status": {"$in": ["pending", "partial"]}, "due_date": {"$lt": now}}
+    if user["role"] == UserRole.LAWYER.value:
+        case_ids = await db.cases.distinct("_id", {"assigned_lawyer_id": user["id"]})
+        inv_query["case_id"] = {"$in": [str(c) for c in case_ids]}
+    overdue_count = await db.invoices.count_documents(inv_query)
+    if overdue_count > 0:
+        label = "ληξιπρόθεσμο" if overdue_count == 1 else "ληξιπρόθεσμα"
+        notifications.append({"id": "overdue-invoices", "type": "overdue",
+            "msg": f"{overdue_count} τιμολόγια", "path": "/billing"})
+
+    end = now + timedelta(days=3)
+    dl_query = {"date": {"$gte": now, "$lte": end}, "completed": {"$ne": True}}
+    if user["role"] == UserRole.LAWYER.value:
+        cids = await db.cases.distinct("_id", {"assigned_lawyer_id": user["id"]})
+        cids_str = [str(c) for c in cids]
+        dl_query["$or"] = [{"case_id": {"$in": cids_str}}, {"created_by": user["id"]}]
+    urgent = await db.deadlines.find(dl_query).sort("date", 1).limit(3).to_list(None)
+    for d in urgent:
+        days_left = (d["date"] - now).days
+        when = "σήμερα" if days_left == 0 else ("αύριο" if days_left == 1 else f"σε {days_left} μέρες")
+        notifications.append({"id": f"deadline-{str(d['_id'])}", "type": "deadline",
+            "msg": f"Προθεσμία {when}: {d.get('title', 'Χωρίς τίτλο')}", "path": "/calendar"})
+
+    if user["role"] == UserRole.ADMIN.value:
+        unread = await db.portal_messages.count_documents({"read_by_lawyer": {"$ne": True}})
+        if unread > 0:
+            notifications.append({"id": "portal-messages", "type": "message",
+                "msg": f"{unread} αναγνωσμένα μηνύματα από πελάτες", "path": "/admin-portal"})
+        pending = await db.portal_reset_requests.count_documents({"used": False})
+        if pending > 0:
+            notifications.append({"id": "portal-resets", "type": "warning",
+                "msg": f"{pending} αιτήματα επαναφοράς κωδικού πύλης", "path": "/admin-portal"})
+
+    return notifications
+
+
+
 @app.post("/api/auth/change-password")
 async def change_password(req: ChangePasswordRequest, user=Depends(get_current_user)):
     full_user = await db.users.find_one({"_id": make_id(user["id"])})
@@ -2922,7 +2971,7 @@ async def register_device_v1(
     try:
         device_service = get_device_service(db)
         result = await device_service.register_device(
-            user_id=str(user["_id"]),
+            user_id=user["id"],
             device_name=req.device_name,
             device_type=req.device_type,
             push_token=req.push_token,
@@ -2933,7 +2982,7 @@ async def register_device_v1(
         if "error" in result:
             raise HTTPException(status_code=400, detail=result["error"])
 
-        await audit("device_registered", user["_id"], "device", details={
+        await audit("device_registered", user["id"], "device", details={
             "device_type": req.device_type,
             "is_new": result.get("is_new", False)
         })
@@ -2951,7 +3000,7 @@ async def list_user_devices_v1(user=Depends(get_current_user)):
     """Get all devices registered for current user"""
     try:
         device_service = get_device_service(db)
-        devices = await device_service.get_user_devices(str(user["_id"]))
+        devices = await device_service.get_user_devices(user["id"])
         return devices
     except Exception as e:
         logger.error(f"Failed to list devices: {str(e)}")
@@ -2969,14 +3018,14 @@ async def trust_device_v1(
         device_service = get_device_service(db)
         success = await device_service.trust_device(
             device_id=device_id,
-            user_id=str(user["_id"]),
+            user_id=user["id"],
             device_name=req.device_name
         )
 
         if not success:
             raise HTTPException(status_code=404, detail="Device not found")
 
-        await audit("device_trusted", user["_id"], "device", resource_id=device_id)
+        await audit("device_trusted", user["id"], "device", resource_id=device_id)
         return {"status": "trusted"}
     except HTTPException:
         raise
@@ -2995,13 +3044,13 @@ async def unregister_device_v1(
         device_service = get_device_service(db)
         success = await device_service.unregister_device(
             device_id=device_id,
-            user_id=str(user["_id"])
+            user_id=user["id"]
         )
 
         if not success:
             raise HTTPException(status_code=404, detail="Device not found")
 
-        await audit("device_unregistered", user["_id"], "device", resource_id=device_id)
+        await audit("device_unregistered", user["id"], "device", resource_id=device_id)
         return {"status": "unregistered"}
     except HTTPException:
         raise
@@ -3064,15 +3113,15 @@ async def logout_device_v1(
     try:
         if device_id:
             device_service = get_device_service(db)
-            await device_service.revoke_device_trust(device_id, str(user["_id"]))
-            await audit("device_logout", user["_id"], "device", resource_id=device_id)
+            await device_service.revoke_device_trust(device_id, user["id"])
+            await audit("device_logout", user["id"], "device", resource_id=device_id)
         else:
             # Logout from all devices
             await db.users.update_one(
                 {"_id": user["_id"]},
                 {"$set": {"trusted_devices": []}}
             )
-            await audit("logout_all_devices", user["_id"], "user")
+            await audit("logout_all_devices", user["id"], "user")
 
         return {"status": "logged_out"}
     except Exception as e:
@@ -3085,7 +3134,7 @@ async def get_current_user_info_v1(user=Depends(get_current_user)):
     """Get current authenticated user info (v1 enhanced with devices)"""
     try:
         device_service = get_device_service(db)
-        devices = await device_service.get_user_devices(str(user["_id"]))
+        devices = await device_service.get_user_devices(user["id"])
 
         user_copy = serialize(user)
         user_copy["devices"] = devices
