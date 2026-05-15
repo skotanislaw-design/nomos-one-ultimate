@@ -5,7 +5,7 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { WifiOff, Wifi, AlertCircle, Cloud, CloudX } from 'lucide-react';
+import { WifiOff, Wifi, AlertCircle, Cloud, CloudOff } from 'lucide-react';
 import { useWebSocketContext } from '@/contexts/WebSocketContext';
 
 interface OfflineOperation {
@@ -259,7 +259,7 @@ export const OfflineIndicator: React.FC = () => {
         <div className="fixed top-16 left-0 right-0 bg-orange-50 border-b border-orange-200 px-4 py-3 z-40">
           <div className="max-w-7xl mx-auto flex items-center justify-between gap-4">
             <div className="flex items-center gap-3">
-              <CloudX size={20} className="text-orange-600" />
+              <CloudOff size={20} className="text-orange-600" />
               <div>
                 <p className="text-sm font-semibold text-orange-900">
                   {ws.messageQueue.length} αναμενόμενα μηνύματα

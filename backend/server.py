@@ -858,6 +858,16 @@ async def list_cases(user=Depends(get_current_user), status: Optional[str] = Non
         result.append(s)
     return result
 
+@app.get("/api/cases/stagnant")
+async def stagnant_cases(user=Depends(get_current_user)):
+    sd = datetime.utcnow() - timedelta(days=STAGNANT_DAYS)
+    q = {"status": "active", "$or": [{"last_activity": {"$lt": sd}},
+         {"last_activity": {"$exists": False}, "created_at": {"$lt": sd}}]}
+    if user["role"] == UserRole.LAWYER.value: q["assigned_lawyer_id"] = user["id"]
+    cases = await db.cases.find(q).to_list(None)
+    result = []
+    for c in cases:
+        s = serialize(c); s["assigned_lawyer_name"] = await get_user_name(s.get("assigned_lawyer_id", "")); result.append(s)
 @app.get("/api/cases/{case_id}")
 async def get_case(case_id: str, user=Depends(get_current_user)):
     case = await db.cases.find_one({"_id": make_id(case_id)})
@@ -1115,16 +1125,6 @@ async def dashboard_stats(user=Depends(get_current_user)):
     return {"total_cases": total, "active_cases": active, "pending_cases": pending,
             "closed_cases": closed, "stagnant_cases": stagnant, "overdue_financials": overdue}
 
-@app.get("/api/cases/stagnant")
-async def stagnant_cases(user=Depends(get_current_user)):
-    sd = datetime.utcnow() - timedelta(days=STAGNANT_DAYS)
-    q = {"status": "active", "$or": [{"last_activity": {"$lt": sd}},
-         {"last_activity": {"$exists": False}, "created_at": {"$lt": sd}}]}
-    if user["role"] == UserRole.LAWYER.value: q["assigned_lawyer_id"] = user["id"]
-    cases = await db.cases.find(q).to_list(None)
-    result = []
-    for c in cases:
-        s = serialize(c); s["assigned_lawyer_name"] = await get_user_name(s.get("assigned_lawyer_id", "")); result.append(s)
     return result
 
 # ── Lookup endpoint for populating dropdowns ──────────────────────────────────
