@@ -51,7 +51,7 @@ class DeviceService:
         Returns:
             Dictionary with device_id and registration details
         """
-        if not self.db:
+        if self.db is None:
             logger.warning("Database not configured")
             return {"error": "Database not available"}
 
