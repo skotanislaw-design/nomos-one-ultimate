@@ -7,6 +7,7 @@ import {
   FileCheck, Bot, Lock, Activity, Sliders, HardDrive, Inbox, Banknote,
 } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
+import { notificationsApi } from '@/lib/api';
 import { usePermissions } from '@/hooks/usePermissions';
 
 // PWA Components
@@ -59,9 +60,6 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'settings', path: '/settings', label: 'Ρυθμίσεις', icon: Settings, section: 'settings' },
 ];
 
-// Fake notification count — in a real app this comes from the backend
-const NOTIF_COUNT = 3;
-
 export default function AppShell() {
   const { user, logout } = useAuth();
   const perms = usePermissions();
@@ -70,6 +68,7 @@ export default function AppShell() {
   const [showProfileMenu, setShowProfileMenu] = useState(false);
   const [showNotifications, setShowNotifications] = useState(false);
   const [notifRead, setNotifRead] = useState(false);
+  const [notifications, setNotifications] = useState<any[]>([]);
   const [clock, setClock] = useState('');
   const [currentPath, setCurrentPath] = useState(window.location.pathname);
   const profileMenuRef = useRef<HTMLDivElement>(null);
@@ -125,12 +124,18 @@ export default function AppShell() {
     '/payments': 'Πληρωμές', '/admin-portal': 'Διαχείριση Πύλης Πελάτη',
   };
 
-  // Mock notifications
-  const notifications = [
-    { id: 1, type: 'overdue', msg: '3 ληξιπρόθεσμα τιμολόγια', time: 'πριν 5λ', path: '/billing' },
-    { id: 2, type: 'deadline', msg: 'Προθεσμία αύριο: Υπόθεση Α123', time: 'πριν 1ω', path: '/calendar' },
-    { id: 3, type: 'ai', msg: 'Lindy AI: Νέο έγγραφο επεξεργάστηκε', time: 'πριν 2ω', path: '/intake' },
-  ];
+  useEffect(() => {
+    const fetchNotifications = async () => {
+      try {
+        const res = await notificationsApi.list();
+        setNotifications(res.data || []);
+        setNotifRead(false);
+      } catch { setNotifications([]); }
+    };
+    fetchNotifications();
+    const interval = setInterval(fetchNotifications, 60000);
+    return () => clearInterval(interval);
+  }, []);
 
   return (
     <div className="min-h-screen" style={{ background: 'linear-gradient(180deg,#071220 0%,#0a1929 40%,#071220 100%)' }}>
@@ -252,9 +257,9 @@ export default function AppShell() {
                 onClick={() => { setShowNotifications(!showNotifications); setNotifRead(true); }}
                 className="relative p-2 rounded-lg text-[#7a9ab8] hover:text-[#C6A75E] hover:bg-[#132B45]/60 transition-all">
                 <Bell size={18} />
-                {!notifRead && (
+                {!notifRead && notifications.length > 0 && (
                   <span className="absolute top-1 right-1 w-4 h-4 rounded-full bg-red-500 border-2 border-[#071220] flex items-center justify-center text-[9px] font-bold text-white">
-                    {NOTIF_COUNT}
+                    {notifications.length}
                   </span>
                 )}
               </button>
@@ -270,11 +275,11 @@ export default function AppShell() {
                       <button key={n.id} onClick={() => navigate(n.path)}
                         className="w-full flex items-start gap-3 px-4 py-3 hover:bg-[#0d2035]/60 transition-all text-left border-b border-[#1a3a5c]/20 last:border-0">
                         <div className={`w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ${
-                          n.type === 'overdue' ? 'bg-red-400' : n.type === 'deadline' ? 'bg-amber-400' : 'bg-purple-400'
+                          n.type === 'overdue' ? 'bg-red-400' : n.type === 'deadline' ? 'bg-amber-400' : n.type === 'warning' ? 'bg-orange-400' : 'bg-blue-400'
                         }`} />
                         <div className="flex-1 min-w-0">
                           <p className="text-xs text-[#d4dce8]">{n.msg}</p>
-                          <p className="text-[10px] text-[#5a7a9a] mt-0.5">{n.time}</p>
+
                         </div>
                       </button>
                     ))}

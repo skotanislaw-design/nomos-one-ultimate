@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Search, Plus, X, Eye, Trash2, Download, Building2, User as UserIcon, AlertTriangle, Phone, Mail, MapPin, Hash, Edit2, Briefcase, ChevronRight } from 'lucide-react';
-import { clientsApi, casesApi } from '@/lib/api';
+import { clientsApi, casesApi, authApi } from '@/lib/api';
 import { usePermissions } from '@/hooks/usePermissions';
 import { SegmentTabs } from '@/components/ui/SegmentTabs';
 import { toast } from 'sonner';
@@ -107,12 +107,14 @@ export default function ClientsPage() {
 
   const handleDeleteConfirm = async () => {
     if (!deleteTarget) return;
-    // Verify admin password (placeholder — real implementation would call backend)
-    if (adminPassword !== 'Admin123@' && !perms.isAdmin) {
-      toast.error('Λάθος κωδικός διαχειριστή');
+    setDeleteLoading(true);
+    try {
+      await authApi.verifyPassword(adminPassword);
+    } catch {
+      toast.error('Λάθος κωδικός');
+      setDeleteLoading(false);
       return;
     }
-    setDeleteLoading(true);
     try {
       await clientsApi.update(deleteTarget._id || deleteTarget.id, { is_active: false });
       toast.success('Πελάτης απενεργοποιήθηκε');

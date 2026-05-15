@@ -29,6 +29,7 @@ export const authApi = {
   login: (email: string, password: string) => api.post('/api/auth/login', { email, password }),
   me: () => api.get('/api/auth/me'),
   changePassword: (current_password: string, new_password: string) => api.post('/api/auth/change-password', { current_password, new_password }),
+  verifyPassword: (current_password: string) => api.post('/api/auth/verify-password', { current_password }),
 };
 
 // ═══════════════ USERS ═══════════════
@@ -284,6 +285,11 @@ export const portalApi = {
 };
 
 // ═══════════════ ADMIN PORTAL MANAGEMENT ═══════════════
+export const notificationsApi = {
+  list: () => api.get('/api/notifications'),
+};
+
+
 export const adminPortalApi = {
   // Generate portal access for a case
   generatePortalAccess: (client_id: string, case_id: string, permissions?: string[]) =>
