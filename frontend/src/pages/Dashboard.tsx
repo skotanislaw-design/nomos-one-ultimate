@@ -18,7 +18,7 @@ export default function Dashboard() {
       deadlinesApi.upcoming(14).catch(() => ({ data: [] })),
       casesApi.stagnant().catch(() => ({ data: [] })),
     ]).then(([s, k, d, st]) => {
-      setStats(s.data); setKpi(k.data); setDeadlines(d.data); setStagnant(st.data);
+      setStats(s.data || {}); setKpi(k.data); setDeadlines(d.data || []); setStagnant(st.data || []);
       setLoading(false);
     });
   }, []);

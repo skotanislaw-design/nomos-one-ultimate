@@ -976,6 +976,7 @@ async def stagnant_cases(user=Depends(get_current_user)):
     result = []
     for c in cases:
         s = serialize(c); s["assigned_lawyer_name"] = await get_user_name(s.get("assigned_lawyer_id", "")); result.append(s)
+    return result
 @app.get("/api/cases/{case_id}")
 async def get_case(case_id: str, user=Depends(get_current_user)):
     case = await db.cases.find_one({"_id": make_id(case_id)})
