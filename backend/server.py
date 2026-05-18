@@ -992,14 +992,16 @@ async def get_case(case_id: str, user=Depends(get_current_user)):
     return s
 
 @app.post("/api/cases", status_code=201)
-async def create_case(req: CaseRequest, user=Depends(require_role(UserRole.ADMIN, UserRole.SECRETARY))):
-    lawyer = await db.users.find_one({"_id": make_id(req.assigned_lawyer_id)})
+async def create_case(req: CaseRequest, user=Depends(get_current_user)):
+    # Use current user as lawyer if not specified
+    lawyer_id = req.assigned_lawyer_id or user["id"]
+    lawyer = await db.users.find_one({"_id": make_id(lawyer_id)})
     if not lawyer: raise HTTPException(404, "Ο δικηγόρος δεν βρέθηκε")
     cl = await db.clients.find_one({"_id": make_id(req.client_id)})
     if not cl: raise HTTPException(404, "Ο εντολέας δεν βρέθηκε")
     cn = await case_number_gen()
     doc = {"title": sanitize_string(req.title), "client_id": req.client_id,
-           "assigned_lawyer_id": req.assigned_lawyer_id, "status": req.status.value,
+           "assigned_lawyer_id": lawyer_id, "status": req.status.value,
            "next_action": sanitize_string(req.next_action or ""), "next_action_date": req.next_action_date,
            "legal_category": req.category or req.legal_category,
            "court": sanitize_string(req.court) if req.court else None,
@@ -1009,7 +1011,7 @@ async def create_case(req: CaseRequest, user=Depends(require_role(UserRole.ADMIN
     result = await db.cases.insert_one(doc)
     await audit("CREATE_CASE", user["id"], "case", str(result.inserted_id))
     doc["_id"] = result.inserted_id; s = serialize(doc)
-    s["assigned_lawyer_name"] = lawyer["name"]; s["client_name"] = cl.get("full_name") or cl.get("name", "")
+    s["assigned_lawyer_name"] = lawyer.get("full_name") or lawyer.get("name", ""); s["client_name"] = cl.get("full_name") or cl.get("name", "")
     return s
 
 @app.put("/api/cases/{case_id}")
