@@ -865,8 +865,9 @@ async def reject_portal_reset(request_id: str, user=Depends(require_role(UserRol
 # CLIENTS
 # ══════════════════════════════════════════════════════════════════════════════
 class ClientRequest(BaseModel):
-    name: str; email: Optional[str] = None; phone: Optional[str] = None
-    address: Optional[str] = None; tax_id: Optional[str] = None; profession: Optional[str] = None; notes: Optional[str] = None
+    full_name: str; email: Optional[str] = None; phone: Optional[str] = None
+    address: Optional[str] = None; afm: Optional[str] = None; client_type: Optional[str] = None
+    profession: Optional[str] = None; notes: Optional[str] = None; is_active: Optional[bool] = None
 
 @app.get("/api/clients")
 async def list_clients(user=Depends(get_current_user)):
@@ -893,11 +894,12 @@ async def get_client(client_id: str, user=Depends(get_current_user)):
 @app.post("/api/clients", status_code=201)
 async def create_client(req: ClientRequest, user=Depends(require_role(UserRole.ADMIN, UserRole.SECRETARY))):
     if req.phone and not validate_phone(req.phone): raise HTTPException(400, "Μη έγκυρος αριθμός τηλεφώνου")
-    if req.tax_id and not validate_tax_id(req.tax_id): raise HTTPException(400, "Μη έγκυρο ΑΦΜ (9 ψηφία)")
+    if req.afm and not validate_tax_id(req.afm): raise HTTPException(400, "Μη έγκυρο ΑΦΜ (9 ψηφία)")
     if req.email and not re.match(r"[^@]+@[^@]+\.[^@]+", req.email.strip()): raise HTTPException(400, "Μη έγκυρο email")
-    doc = {"name": sanitize_string(req.name), "email": req.email.strip().lower() if req.email else None,
+    doc = {"full_name": sanitize_string(req.full_name), "email": req.email.strip().lower() if req.email else None,
            "phone": req.phone.strip() if req.phone else None, "address": sanitize_string(req.address) if req.address else None,
-           "tax_id": req.tax_id.strip() if req.tax_id else None, "notes": sanitize_string(req.notes) if req.notes else None,
+           "afm": req.afm.strip() if req.afm else None, "client_type": req.client_type or "individual",
+           "notes": sanitize_string(req.notes) if req.notes else None,
            "created_at": datetime.utcnow(), "created_by": user["id"]}
     result = await db.clients.insert_one(doc)
     await audit("CREATE_CLIENT", user["id"], "client", str(result.inserted_id))
@@ -906,11 +908,12 @@ async def create_client(req: ClientRequest, user=Depends(require_role(UserRole.A
 @app.put("/api/clients/{client_id}")
 async def update_client(client_id: str, req: ClientRequest, user=Depends(require_role(UserRole.ADMIN, UserRole.SECRETARY))):
     if req.phone and not validate_phone(req.phone): raise HTTPException(400, "Μη έγκυρος αριθμός τηλεφώνου")
-    if req.tax_id and not validate_tax_id(req.tax_id): raise HTTPException(400, "Μη έγκυρο ΑΦΜ (9 ψηφία)")
+    if req.afm and not validate_tax_id(req.afm): raise HTTPException(400, "Μη έγκυρο ΑΦΜ (9 ψηφία)")
     if req.email and not re.match(r"[^@]+@[^@]+\.[^@]+", req.email.strip()): raise HTTPException(400, "Μη έγκυρο email")
-    data = {"name": sanitize_string(req.name), "email": req.email.strip().lower() if req.email else None,
+    data = {"full_name": sanitize_string(req.full_name), "email": req.email.strip().lower() if req.email else None,
             "phone": req.phone.strip() if req.phone else None, "address": sanitize_string(req.address) if req.address else None,
-            "tax_id": req.tax_id.strip() if req.tax_id else None, "notes": sanitize_string(req.notes) if req.notes else None,
+            "afm": req.afm.strip() if req.afm else None, "client_type": req.client_type,
+            "notes": sanitize_string(req.notes) if req.notes else None,
             "updated_at": datetime.utcnow()}
     await db.clients.update_one({"_id": make_id(client_id)}, {"$set": data})
     await audit("UPDATE_CLIENT", user["id"], "client", client_id)
@@ -931,10 +934,10 @@ async def export_client(client_id: str, user=Depends(require_role(UserRole.ADMIN
 # CASES — atomic case number
 # ══════════════════════════════════════════════════════════════════════════════
 class CaseRequest(BaseModel):
-    title: str; client_id: str; assigned_lawyer_id: str
-    status: CaseStatus = CaseStatus.ACTIVE; legal_category: Optional[str] = None; next_action: str
-    next_action_date: Optional[datetime] = None; court: Optional[str] = None
-    description: Optional[str] = None
+    title: str; client_id: str; assigned_lawyer_id: Optional[str] = None
+    status: CaseStatus = CaseStatus.ACTIVE; legal_category: Optional[str] = None; category: Optional[str] = None
+    next_action: Optional[str] = None; next_action_date: Optional[datetime] = None; court: Optional[str] = None
+    description: Optional[str] = None; summary: Optional[str] = None
 
 class CaseStatusUpdate(BaseModel):
     status: CaseStatus; next_action: Optional[str] = None; next_action_date: Optional[datetime] = None
@@ -997,15 +1000,16 @@ async def create_case(req: CaseRequest, user=Depends(require_role(UserRole.ADMIN
     cn = await case_number_gen()
     doc = {"title": sanitize_string(req.title), "client_id": req.client_id,
            "assigned_lawyer_id": req.assigned_lawyer_id, "status": req.status.value,
-           "next_action": sanitize_string(req.next_action), "next_action_date": req.next_action_date,
+           "next_action": sanitize_string(req.next_action or ""), "next_action_date": req.next_action_date,
+           "legal_category": req.category or req.legal_category,
            "court": sanitize_string(req.court) if req.court else None,
-           "description": sanitize_string(req.description) if req.description else None,
+           "description": sanitize_string(req.summary or req.description or "") if (req.summary or req.description) else None,
            "case_number": cn, "created_at": datetime.utcnow(), "created_by": user["id"],
            "updated_at": datetime.utcnow(), "last_activity": datetime.utcnow()}
     result = await db.cases.insert_one(doc)
     await audit("CREATE_CASE", user["id"], "case", str(result.inserted_id))
     doc["_id"] = result.inserted_id; s = serialize(doc)
-    s["assigned_lawyer_name"] = lawyer["name"]; s["client_name"] = cl["name"]
+    s["assigned_lawyer_name"] = lawyer["name"]; s["client_name"] = cl.get("full_name") or cl.get("name", "")
     return s
 
 @app.put("/api/cases/{case_id}")
@@ -1264,10 +1268,12 @@ class DeadlineType(str, Enum):
 class DeadlineRequest(BaseModel):
     case_id: Optional[str] = None
     title: str
-    deadline_type: DeadlineType
-    date: datetime
+    deadline_type: Optional[str] = None
+    type: Optional[str] = None
+    date: Optional[datetime] = None
+    due_date: Optional[str] = None
     description: Optional[str] = None
-    reminder_days: int = 3  # days before to remind
+    reminder_days: int = 3
     all_day: bool = True
     location: Optional[str] = None
 
@@ -1351,8 +1357,8 @@ async def create_deadline(req: DeadlineRequest, user=Depends(get_current_user)):
     doc = {
         "case_id": req.case_id,
         "title": sanitize_string(req.title),
-        "deadline_type": req.deadline_type.value,
-        "date": req.date,
+        "deadline_type": (req.deadline_type or req.type or "hearing"),
+        "date": req.due_date and __import__('datetime').datetime.fromisoformat(req.due_date) or req.date or __import__('datetime').datetime.utcnow(),
         "description": sanitize_string(req.description) if req.description else None,
         "reminder_days": req.reminder_days,
         "all_day": req.all_day,
