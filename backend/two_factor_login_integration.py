@@ -16,12 +16,19 @@ Key Integration Points:
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import bcrypt
 from uuid import uuid4
+import jwt
+import os
 
 from two_factor_service import TwoFactorService, OTPSessionType, OTPMethod
 from email_service import send_otp_email
+
+# JWT Configuration
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_HOURS = int(os.getenv("JWT_EXPIRY_HOURS", "8"))
 
 
 # ==================== Models ====================
@@ -212,10 +219,11 @@ async def verify_otp_endpoint(
         if not otp_session:
             raise HTTPException(status_code=400, detail="Invalid OTP session")
 
-        user_id = otp_session["user_id"]
+        user_id_str = str(otp_session["user_id"])
+        user_id = otp_session["user_id"]  # Keep original type for DB queries
 
         # Check rate limiting before verification
-        is_locked, locked_until = await two_factor_service.is_otp_locked(user_id)
+        is_locked, locked_until = await two_factor_service.is_otp_locked(user_id_str)
         if is_locked:
             raise HTTPException(
                 status_code=429,
@@ -227,7 +235,7 @@ async def verify_otp_endpoint(
 
         if "totp" in session_type:
             # Verify TOTP code
-            valid, error = await two_factor_service.verify_totp_code(str(user_id), request.code)
+            valid, error = await two_factor_service.verify_totp_code(user_id_str, request.code)
         else:
             # Verify Email OTP
             valid, error = await two_factor_service.verify_email_otp(
@@ -236,18 +244,18 @@ async def verify_otp_endpoint(
 
         if not valid:
             # Step 3: Increment failed attempts
-            await two_factor_service.increment_failed_otp_attempts(user_id)
+            await two_factor_service.increment_failed_otp_attempts(user_id_str)
 
             # Audit log
             await audit_log(
-                db, user_id, "2fa.otp_attempt_failed",
+                db, user_id_str, "2fa.otp_attempt_failed",
                 {"session_id": request.otp_session_id}
             )
 
             raise HTTPException(status_code=401, detail=error or "Invalid code")
 
         # Step 4: Success - reset attempts
-        await two_factor_service.reset_failed_otp_attempts(user_id)
+        await two_factor_service.reset_failed_otp_attempts(user_id_str)
 
         # Get user for token
         user = await db.users.find_one({"_id": user_id})
@@ -259,7 +267,7 @@ async def verify_otp_endpoint(
         trust_expires = None
         if request.trust_device:
             await two_factor_service.mark_device_as_trusted(
-                str(user_id),
+                user_id_str,
                 otp_session["device_id"],
                 otp_session.get("device_name", "Unknown Device")
             )
@@ -268,14 +276,14 @@ async def verify_otp_endpoint(
             device = await db.devices.find_one({
                 "_id": otp_session["device_id"]
             })
-            trust_expires = device.get("trust_expires_at")
+            trust_expires = device.get("trust_expires_at") if device else None
 
         # Audit log successful verification
         await audit_log(
-            db, user_id, "2fa.verified",
+            db, user_id_str, "2fa.verified",
             {
                 "method": "totp" if "totp" in session_type else "email",
-                "device_id": otp_session["device_id"],
+                "device_id": str(otp_session["device_id"]),
                 "trusted": request.trust_device
             }
         )
@@ -335,16 +343,17 @@ async def verify_backup_code_endpoint(
         if not otp_session:
             raise HTTPException(status_code=400, detail="Invalid OTP session")
 
-        user_id = otp_session["user_id"]
+        user_id_str = str(otp_session["user_id"])
+        user_id = otp_session["user_id"]  # Keep original type for DB queries
 
         # Step 2: Verify backup code
         valid, error, remaining = await two_factor_service.use_backup_code(
-            str(user_id), request.code
+            user_id_str, request.code
         )
 
         if not valid:
             # Increment failed attempts
-            await two_factor_service.increment_failed_otp_attempts(user_id)
+            await two_factor_service.increment_failed_otp_attempts(user_id_str)
             raise HTTPException(status_code=401, detail=error)
 
         # Get user for token
@@ -355,7 +364,7 @@ async def verify_backup_code_endpoint(
 
         # Audit log
         await audit_log(
-            db, user_id, "2fa.backup_code_used",
+            db, user_id_str, "2fa.backup_code_used",
             {"codes_remaining": remaining}
         )
 
@@ -388,18 +397,26 @@ def create_jwt_token(user: dict) -> str:
     """
     Create JWT token for authenticated user
 
-    Implementation depends on existing auth system.
-    Should create token with:
+    Token payload:
     - sub: user_id
     - email: user email
     - role: user role
-    - exp: expiry time (8 hours)
+    - exp: expiry time (8 hours from now)
     """
-    # TODO: Implement using existing JWT creation function from auth module
-    # Example:
-    # from auth_service import create_access_token
-    # return create_access_token(subject=str(user["_id"]))
-    pass
+    payload = {
+        "sub": str(user["_id"]),
+        "email": user.get("email", ""),
+        "role": user.get("role", "client"),
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
+    }
+
+    # Use JWT_SECRET from environment, or generate one if not set
+    secret = JWT_SECRET
+    if not secret or secret.startswith("CHANGE"):
+        import secrets
+        secret = secrets.token_hex(32)
+
+    return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
 
 
 async def audit_log(

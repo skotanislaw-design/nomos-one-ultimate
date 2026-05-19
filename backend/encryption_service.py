@@ -10,7 +10,7 @@ import base64
 from typing import Dict, Any, Union
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import secrets
 from datetime import datetime
 import logging
@@ -52,8 +52,8 @@ class KeyManager:
         return self.current_key_id, self.master_key
 
     def derive_key(self, salt: bytes) -> bytes:
-        """Derive encryption key from master key using PBKDF2"""
-        kdf = PBKDF2(
+        """Derive encryption key from master key using PBKDF2HMAC"""
+        kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,

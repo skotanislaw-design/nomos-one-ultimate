@@ -33,6 +33,11 @@ from device_service import get_device_service
 from push_service import get_push_service
 from ai_service import extract_document as ai_extract_document, intake_analyze
 
+# ── Two-Factor Authentication (Phase 1.6) ──────────────────────────────────────
+from two_factor_service import TwoFactorService, OTPSessionType
+from encryption_service import EncryptionService
+from email_service import send_otp_email
+
 # ── WebSocket & Real-time Messaging (Phase 1.7) ────────────────────────────────
 from websocket_service import get_websocket_manager
 from websocket_routes import router as ws_router, set_jwt_secret
@@ -146,9 +151,13 @@ app.add_middleware(
 client: AsyncIOMotorClient = None
 db = None
 
+# ── 2FA Services ──────────────────────────────────────────────────────────────
+encryption_service: EncryptionService = None
+two_factor_service: TwoFactorService = None
+
 @app.on_event("startup")
 async def startup():
-    global client, db
+    global client, db, encryption_service, two_factor_service
     client = AsyncIOMotorClient(MONGO_URI)
     db = client[DB_NAME]
     await db.users.create_index("email", unique=True)
@@ -175,7 +184,17 @@ async def startup():
         count = await db.cases.count_documents({"case_number": {"$regex": f"^{year}-"}})
         await db.counters.update_one({"_id": "case_number"}, {"$set": {"year": year, "seq": count}}, upsert=True)
 
-    # ── Phase 1.7: WebSocket Real-time Messaging ───────────────────────────
+    # ── Phase 1.6: Two-Factor Authentication ─────────────────────────────────
+    # Initialize TwoFactorService
+    encryption_service = EncryptionService()
+    two_factor_service = TwoFactorService(db, encryption_service)
+    logger.info("TwoFactorService initialized")
+
+    # Create OTP sessions collection with TTL index for auto-cleanup
+    await db.otp_sessions.create_index([("expires_at", 1)], expireAfterSeconds=0)
+    logger.info("OTP sessions collection initialized with TTL index")
+
+    # ── Phase 1.7: WebSocket Real-time Messaging ───────────────────────────────
     # Initialize WebSocket manager
     ws_manager = get_websocket_manager()
     logger.info(f"WebSocket manager initialized: {ws_manager}")
@@ -577,6 +596,7 @@ async def gdrive_setup(
 class LoginRequest(BaseModel):
     email: str
     password: str
+    device_id: Optional[str] = None  # For 2FA device trust
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
@@ -603,7 +623,7 @@ class PortalAccessRequest(BaseModel):
     ])
 
 @app.post("/api/auth/login")
-async def login(req: LoginRequest):
+async def login(req: LoginRequest, request: Request):
     email = req.email.strip().lower()
     if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
         raise HTTPException(400, "Μη έγκυρη μορφή email")
@@ -619,6 +639,68 @@ async def login(req: LoginRequest):
     if not user.get("is_approved", True):
         raise HTTPException(403, "Ο λογαριασμός σας δεν έχει εγκριθεί ακόμα από τον διαχειριστή")
     rate_limiter.clear(email)
+
+    # ── Phase 1.6: Check 2FA Status ────────────────────────────────────────
+    try:
+        user_id_str = str(user["_id"])
+        two_fa_status = await two_factor_service.get_2fa_status(user_id_str)
+
+        # Check if device is trusted (skip 2FA if it is)
+        device_id = req.device_id or "unknown"
+        is_device_trusted = await two_factor_service.is_device_trusted(user_id_str, device_id)
+
+        # If 2FA enabled and device not trusted, create OTP session
+        if two_fa_status.get("enabled", False) and not is_device_trusted:
+            # Create OTP session
+            otp_session = await two_factor_service.create_otp_session(
+                user_id=user_id_str,
+                device_id=device_id,
+                session_type=(
+                    OTPSessionType.EMAIL_LOGIN
+                    if two_fa_status.get("method") == "email"
+                    else OTPSessionType.TOTP_LOGIN
+                ),
+                ip_address=request.client.host if request.client else "unknown",
+                user_agent=request.headers.get("user-agent", "unknown")
+            )
+
+            # Send OTP email if email method
+            if two_fa_status.get("method") == "email":
+                await send_otp_email(
+                    user["email"],
+                    user.get("name", "User"),
+                    otp_session["otp_code"],
+                    expires_minutes=10
+                )
+
+                # Audit log
+                await db.audit_logs.insert_one({
+                    "timestamp": datetime.utcnow(),
+                    "user_id": user_id_str,
+                    "action": "2fa.otp_sent",
+                    "details": {"method": "email", "device_id": device_id}
+                })
+
+            # Return OTP challenge instead of token
+            def mask_email(email: str) -> str:
+                try:
+                    local, domain = email.split('@')
+                    masked = local[:3] + "***" if len(local) > 3 else local[0] + "***"
+                    return f"{masked}@{domain}"
+                except:
+                    return "***@***"
+
+            return {
+                "requires_2fa": True,
+                "otp_session_id": otp_session["session_id"],
+                "method": two_fa_status.get("method"),
+                "email_masked": mask_email(user["email"]),
+                "expires_in": otp_session.get("expires_in_seconds", 600)
+            }
+    except Exception as e:
+        logger.warning(f"2FA check failed: {str(e)}, allowing login without 2FA")
+
+    # Issue token (2FA not enabled or device trusted)
     token = create_token({"sub": str(user["_id"]), "role": user["role"]})
     await audit("LOGIN", str(user["_id"]), "auth")
     u = serialize(user)
@@ -635,6 +717,163 @@ async def verify_current_password(req: ChangePasswordRequest, user=Depends(get_c
     if not full_user or not verify_password(req.current_password, full_user["password"]):
         raise HTTPException(401, "Λάθος κωδικός")
     return {"ok": True}
+
+# ── Phase 1.6: Two-Factor Authentication Endpoints ───────────────────────────────
+
+class OTPVerifyRequest(BaseModel):
+    """OTP verification request"""
+    otp_session_id: str
+    code: str
+    trust_device: bool = False
+
+class BackupCodeVerifyRequest(BaseModel):
+    """Backup code verification request"""
+    otp_session_id: str
+    code: str
+
+@app.post("/api/auth/verify-otp")
+async def verify_otp(req: OTPVerifyRequest, request: Request):
+    """Verify OTP code and issue JWT token"""
+    try:
+        from bson import ObjectId
+
+        # Get OTP session
+        otp_session = await db.otp_sessions.find_one({"_id": ObjectId(req.otp_session_id)})
+        if not otp_session:
+            raise HTTPException(status_code=400, detail="Invalid OTP session")
+
+        user_id_str = str(otp_session["user_id"])
+        user_id = otp_session["user_id"]
+
+        # Check rate limiting
+        is_locked, locked_until = await two_factor_service.is_otp_locked(user_id_str)
+        if is_locked:
+            raise HTTPException(status_code=429, detail="Account locked. Try again in 15 minutes.")
+
+        # Verify OTP code
+        session_type = otp_session.get("otp_type", "email_login")
+        if "totp" in session_type:
+            valid, error = await two_factor_service.verify_totp_code(user_id_str, req.code)
+        else:
+            valid, error = await two_factor_service.verify_email_otp(str(req.otp_session_id), req.code)
+
+        if not valid:
+            await two_factor_service.increment_failed_otp_attempts(user_id_str)
+            await db.audit_logs.insert_one({
+                "timestamp": datetime.utcnow(),
+                "user_id": user_id_str,
+                "action": "2fa.otp_attempt_failed",
+                "details": {"session_id": req.otp_session_id}
+            })
+            raise HTTPException(status_code=401, detail=error or "Invalid code")
+
+        # Reset failed attempts
+        await two_factor_service.reset_failed_otp_attempts(user_id_str)
+
+        # Get user for token
+        user = await db.users.find_one({"_id": user_id})
+
+        # Issue JWT token
+        token = create_token({"sub": str(user["_id"]), "role": user["role"]})
+
+        # Mark device as trusted if requested
+        trust_expires = None
+        if req.trust_device:
+            await two_factor_service.mark_device_as_trusted(
+                user_id_str,
+                otp_session["device_id"],
+                otp_session.get("device_name", "Unknown Device")
+            )
+            device = await db.devices.find_one({"_id": otp_session["device_id"]})
+            trust_expires = device.get("trust_expires_at") if device else None
+
+        # Audit log successful verification
+        await db.audit_logs.insert_one({
+            "timestamp": datetime.utcnow(),
+            "user_id": user_id_str,
+            "action": "2fa.verified",
+            "details": {
+                "method": "totp" if "totp" in session_type else "email",
+                "device_id": str(otp_session["device_id"]),
+                "trusted": req.trust_device
+            }
+        })
+
+        # Mark OTP session as verified
+        await db.otp_sessions.update_one(
+            {"_id": ObjectId(req.otp_session_id)},
+            {"$set": {"verified": True, "verified_at": datetime.utcnow()}}
+        )
+
+        u = serialize(user)
+        u.pop("password", None)
+        return {
+            "token": token,
+            "user": u,
+            "device_trusted": req.trust_device,
+            "trust_expires": trust_expires
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"OTP verification error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"OTP verification error: {str(e)}")
+
+
+@app.post("/api/auth/verify-backup-code")
+async def verify_backup_code(req: BackupCodeVerifyRequest):
+    """Verify backup code and issue JWT token"""
+    try:
+        from bson import ObjectId
+
+        # Get OTP session
+        otp_session = await db.otp_sessions.find_one({"_id": ObjectId(req.otp_session_id)})
+        if not otp_session:
+            raise HTTPException(status_code=400, detail="Invalid OTP session")
+
+        user_id_str = str(otp_session["user_id"])
+        user_id = otp_session["user_id"]
+
+        # Verify backup code
+        valid, error, remaining = await two_factor_service.use_backup_code(user_id_str, req.code)
+        if not valid:
+            await two_factor_service.increment_failed_otp_attempts(user_id_str)
+            raise HTTPException(status_code=401, detail=error)
+
+        # Get user for token
+        user = await db.users.find_one({"_id": user_id})
+
+        # Issue JWT token
+        token = create_token({"sub": str(user["_id"]), "role": user["role"]})
+
+        # Audit log
+        await db.audit_logs.insert_one({
+            "timestamp": datetime.utcnow(),
+            "user_id": user_id_str,
+            "action": "2fa.backup_code_used",
+            "details": {"codes_remaining": remaining}
+        })
+
+        # Mark OTP session as verified
+        await db.otp_sessions.update_one(
+            {"_id": ObjectId(req.otp_session_id)},
+            {"$set": {"verified": True, "verified_at": datetime.utcnow()}}
+        )
+
+        u = serialize(user)
+        u.pop("password", None)
+        return {
+            "token": token,
+            "user": u,
+            "codes_remaining": remaining
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Backup code verification error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Backup code error: {str(e)}")
 
 @app.get("/api/notifications")
 async def get_notifications(user=Depends(get_current_user)):

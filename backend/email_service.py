@@ -862,6 +862,7 @@ def create_backup_codes_email(user_name: str, codes: List[str]) -> tuple[str, st
     </html>
     """
 
+    codes_text = '\n    '.join(codes)
     text = f"""
     Κωδικοί Ανάκτησης - Nomos One
 
@@ -869,7 +870,7 @@ def create_backup_codes_email(user_name: str, codes: List[str]) -> tuple[str, st
 
     Εδώ είναι οι κωδικοί ανάκτησης για το λογαριασμό σας:
 
-    {''.join(f'{code}\n' for code in codes)}
+    {codes_text}
 
     ⚠️ ΣΗΜΑΝΤΙΚΟ:
     - Σώστε τους κωδικούς σε ασφαλές μέρος
