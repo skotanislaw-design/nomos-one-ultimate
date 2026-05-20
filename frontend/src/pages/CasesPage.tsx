@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Search, Plus, X, Eye, Trash2, Download, AlertTriangle, ArrowUpDown } from 'lucide-react';
 import { casesApi, clientsApi } from '@/lib/api';
+import DocumentScanButton, { ExtractedData } from '@/components/DocumentScanButton';
 import { usePermissions } from '@/hooks/usePermissions';
 import { SegmentTabs } from '@/components/ui/SegmentTabs';
 import { toast } from 'sonner';
@@ -30,6 +31,18 @@ export default function CasesPage() {
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [sortKey, setSortKey] = useState<SortKey>('created_at');
   const [sortAsc, setSortAsc] = useState(false);
+  const handleScanExtract = (data: ExtractedData) => {
+    if (data.case) {
+      const cs = data.case;
+      setForm(prev => ({
+        ...prev,
+        title: cs.title || prev.title,
+        category: cs.category || prev.category,
+        summary: [cs.summary, cs.court ? 'Δικαστήριο: ' + cs.court : null, cs.opposing_party ? 'Αντίδικος: ' + cs.opposing_party : null].filter(Boolean).join(' | ') || prev.summary,
+      }));
+    }
+  };
+
   const [form, setForm] = useState({ title: '', client_id: '', category: 'ποινικό', summary: '' });
   const perms = usePermissions();
 
@@ -197,6 +210,7 @@ export default function CasesPage() {
               <button onClick={() => setShowAdd(false)} className="p-2 rounded-lg hover:bg-[#132B45] text-[#7a9ab8]"><X size={18} /></button>
             </div>
             <form onSubmit={handleAdd} className="p-6 space-y-4">
+              <DocumentScanButton onExtracted={handleScanExtract} className="w-full mb-2" />
               <div><label className="label">Τίτλος</label><input value={form.title} onChange={e => setForm({...form, title: e.target.value})} className="input-dark" required /></div>
               <div className="grid grid-cols-2 gap-3">
                 <div><label className="label">Πελάτης</label><select value={form.client_id} onChange={e => setForm({...form, client_id: e.target.value})} className="input-dark"><option value="">Επιλέξτε...</option>{clients.map(cl => <option key={cl._id || cl.id} value={cl._id || cl.id}>{cl.full_name}</option>)}</select></div>

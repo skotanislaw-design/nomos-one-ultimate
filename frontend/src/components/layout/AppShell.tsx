@@ -167,49 +167,90 @@ export default function AppShell() {
         </div>
 
         {/* Nav */}
-        <nav className="flex-1 py-4 px-2 overflow-y-auto">
-          <div className={`text-[10px] font-semibold uppercase tracking-widest text-[#4a6a8a] mb-3 ${collapsed ? 'text-center' : 'px-3'}`}>
-            {collapsed ? '•••' : 'Πλοήγηση'}
-          </div>
-          {visibleNav.map((item) => {
-            const isActive = currentPath === item.path || (item.path !== '/' && currentPath.startsWith(item.path));
-            const Icon = item.icon;
-            const readOnly = perms.isReadOnly(item.section as any);
+        <nav className="flex-1 py-3 px-2 overflow-y-auto">
+          {[
+            {
+              label: 'Κύρια', items: [
+                { id: 'dashboard', path: '/', label: 'Dashboard', icon: LayoutDashboard, section: 'dashboard' },
+                { id: 'intake', path: '/intake', label: 'AI Intake', icon: Inbox, section: 'dashboard' },
+              ]
+            },
+            {
+              label: 'Πελάτες & Υποθέσεις', items: [
+                { id: 'clients', path: '/clients', label: 'Πελάτες', icon: Users, section: 'clients' },
+                { id: 'cases', path: '/cases', label: 'Υποθέσεις', icon: Briefcase, section: 'cases' },
+                { id: 'documents', path: '/documents', label: 'Θησαυροφυλάκιο', icon: HardDrive, section: 'cases' },
+                { id: 'calendar', path: '/calendar', label: 'Ημερολόγιο', icon: Calendar, section: 'calendar' },
+              ]
+            },
+            {
+              label: 'Οικονομικά', items: [
+                { id: 'invoicing', path: '/invoicing', label: 'Τιμολόγηση', icon: CreditCard, section: 'invoicing' },
+                { id: 'payments', path: '/payments', label: 'Πληρωμές', icon: Banknote, section: 'invoicing' },
+                { id: 'receipt', path: '/receipt', label: 'Αποδείξεις', icon: Receipt, section: 'invoicing' },
+                { id: 'expenses', path: '/expenses', label: 'Έξοδα', icon: Receipt, section: 'expenses' },
+                { id: 'billing', path: '/billing', label: 'Billing Engine', icon: TrendingUp, section: 'billing' },
+              ]
+            },
+            {
+              label: 'Εργαλεία', items: [
+                { id: 'crm-workflow', path: '/crm-workflow', label: 'CRM & Workflow', icon: GitBranch, section: 'crm' },
+                { id: 'templates', path: '/templates', label: 'Πρότυπα', icon: FileCheck, section: 'templates' },
+                { id: 'reports', path: '/reports', label: 'Αναφορές', icon: BarChart3, section: 'reports' },
+              ]
+            },
+            {
+              label: 'Διαχείριση', items: [
+                { id: 'users', path: '/users', label: 'Χρήστες', icon: Shield, section: 'users' },
+                { id: 'admin-portal', path: '/admin-portal', label: 'Πύλη Πελάτη', icon: Lock, section: 'users' },
+                { id: 'settings', path: '/settings', label: 'Ρυθμίσεις', icon: Settings, section: 'settings' },
+              ]
+            },
+            {
+              label: 'AI', items: [
+                { id: 'bot', path: '/bot', label: 'Nomos AI', icon: Bot, section: 'dashboard' },
+              ]
+            },
+          ].map(group => {
+            const groupItems = group.items.filter(item => perms.canView(item.section as any));
+            if (groupItems.length === 0) return null;
             return (
-              <button key={item.id} onClick={() => navigate(item.path)}
-                className={`w-full flex items-center gap-3 rounded-lg mb-0.5 transition-all duration-200 group relative
-                  ${collapsed ? 'justify-center px-2 py-2.5' : 'px-3 py-2.5'}
-                  ${isActive ? 'bg-[#132B45]/80 text-[#C6A75E]' : 'text-[#7a9ab8] hover:text-[#c0d0e0] hover:bg-[#0d2035]/60'}`}>
-                {isActive && <div className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-6 rounded-r-full bg-[#C6A75E]" />}
-                <Icon size={18} className={isActive ? 'text-[#C6A75E]' : ''} />
-                {!collapsed && <span className={`text-sm flex-1 text-left ${isActive ? 'font-semibold' : 'font-medium'}`}>{item.label}</span>}
-                {!collapsed && readOnly && <Lock size={11} className="text-amber-500/60" />}
-                {collapsed && (
-                  <div className="absolute left-full ml-2 px-2 py-1 bg-[#132B45] text-[#d4dce8] text-xs rounded-md opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 border border-[#1a3a5c]">
-                    {item.label}
-                  </div>
+              <div key={group.label} className="mb-1">
+                {!collapsed && (
+                  <div className="nav-section-label">{group.label}</div>
                 )}
-              </button>
+                {collapsed && <div className="my-2 mx-auto w-8 h-px bg-[#1a3a5c]/50" />}
+                {groupItems.map((item) => {
+                  const isActive = currentPath === item.path || (item.path !== '/' && currentPath.startsWith(item.path));
+                  const Icon = item.icon;
+                  const readOnly = perms.isReadOnly(item.section as any);
+                  return (
+                    <button key={item.id} onClick={() => navigate(item.path)}
+                      className={`w-full flex items-center gap-3 rounded-lg mb-0.5 transition-all duration-200 group relative cursor-pointer
+                        ${collapsed ? 'justify-center px-2 py-2.5' : 'px-3 py-2'}
+                        ${isActive
+                          ? 'bg-gradient-to-r from-[#132B45]/90 to-[#0d2035]/60 text-[#C6A75E]'
+                          : 'text-[#6a8aaa] hover:text-[#c0d0e0] hover:bg-[#0d2035]/50'
+                        }`}>
+                      {isActive && <div className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-r-full bg-[#C6A75E]" />}
+                      <Icon size={16} className={`flex-shrink-0 transition-colors ${isActive ? 'text-[#C6A75E]' : 'group-hover:text-[#a0b8d0]'}`} />
+                      {!collapsed && (
+                        <span className={`text-[13px] flex-1 text-left transition-colors ${isActive ? 'font-semibold text-[#E8C97A]' : 'font-medium'}`}>
+                          {item.label}
+                        </span>
+                      )}
+                      {!collapsed && readOnly && <Lock size={10} className="text-amber-500/50 flex-shrink-0" />}
+                      {collapsed && (
+                        <div className="absolute left-full ml-3 px-2.5 py-1.5 bg-[#0d2035] text-[#d4dce8] text-xs rounded-lg opacity-0 pointer-events-none group-hover:opacity-100 transition-all whitespace-nowrap z-50 border border-[#1a3a5c] shadow-xl">
+                          {item.label}
+                        </div>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
             );
           })}
-
-          {/* AI section */}
-          <div className={`text-[10px] font-semibold uppercase tracking-widest text-[#4a6a8a] mt-4 mb-3 ${collapsed ? 'text-center' : 'px-3'}`}>
-            {collapsed ? 'AI' : 'Νοητική Νομοσύνη'}
-          </div>
-          <button onClick={() => navigate('/bot')}
-            className={`w-full flex items-center gap-3 rounded-lg mb-0.5 px-3 py-2.5 transition-all duration-200 group relative
-              ${currentPath === '/bot' ? 'bg-[#132B45]/80 text-[#C6A75E]' : 'text-[#7a9ab8] hover:text-[#c0d0e0] hover:bg-[#0d2035]/60'}
-              ${collapsed ? 'justify-center px-2' : ''}`}>
-            {currentPath === '/bot' && <div className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-6 rounded-r-full bg-[#C6A75E]" />}
-            <Bot size={18} className={currentPath === '/bot' ? 'text-[#C6A75E]' : ''} />
-            {!collapsed && <span className={`text-sm ${currentPath === '/bot' ? 'font-semibold' : 'font-medium'}`}>Nomos AI</span>}
-            {collapsed && (
-              <div className="absolute left-full ml-2 px-2 py-1 bg-[#132B45] text-[#d4dce8] text-xs rounded-md opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 border border-[#1a3a5c]">
-                Nomos AI
-              </div>
-            )}
-          </button>
         </nav>
 
         {/* Collapse toggle */}

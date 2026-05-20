@@ -1,11 +1,165 @@
 import { useEffect, useState } from 'react';
-import { Save, Shield, Bell, Building2, Lock, Users, Tag, Cloud, Bot, Link2, CreditCard, AlertCircle, CheckCircle } from 'lucide-react';
-import { settingsApi } from '@/lib/api';
+import { Save, Shield, Bell, Building2, Lock, Users, Tag, Cloud, Bot, Link2, CreditCard, AlertCircle, CheckCircle, ExternalLink, Upload, RefreshCw, FolderOpen } from 'lucide-react';
+import { settingsApi, gdriveApi } from '@/lib/api';
 import { usePermissions } from '@/hooks/usePermissions';
 import { SegmentTabs } from '@/components/ui/SegmentTabs';
 import { toast } from 'sonner';
 
 type SettingsTab = 'general' | 'security' | 'notifications' | 'integrations' | 'ai' | 'billing_config' | 'team' | 'categories';
+
+
+// ── Google Drive Card ─────────────────────────────────────────────────────────
+function GoogleDriveCard({ isAdmin }: { isAdmin: boolean }) {
+  const [status, setStatus] = useState<any>(null);
+  const [folderInput, setFolderInput] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  const fetchStatus = async () => {
+    try { const r = await gdriveApi.status(); setStatus(r.data); }
+    catch { setStatus(null); }
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => { fetchStatus(); }, []);
+
+  const handleOAuthClient = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]; if (!file) return;
+    setUploading(true);
+    try {
+      const fd = new FormData(); fd.append('file', file);
+      const token = localStorage.getItem('token') || localStorage.getItem('nomos_token') || '';
+      await fetch('/api/integrations/gdrive/oauth/client', { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: fd });
+      toast.success('OAuth client φορτώθηκε');
+      await fetchStatus();
+    } catch { toast.error('Σφάλμα φόρτωσης'); }
+    finally { setUploading(false); e.target.value = ''; }
+  };
+
+  const handleSetFolder = async () => {
+    if (!folderInput.trim()) return;
+    try {
+      const token = localStorage.getItem('token') || localStorage.getItem('nomos_token') || '';
+      await fetch('/api/integrations/gdrive/folder', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ folder_url: folderInput.trim() }),
+      });
+      toast.success('Φάκελος αποθηκεύτηκε');
+      setFolderInput('');
+      await fetchStatus();
+    } catch { toast.error('Σφάλμα αποθήκευσης φακέλου'); }
+  };
+
+  if (loading) return (
+    <div className="glass-card p-6 flex items-center gap-3">
+      <Cloud size={16} className="text-blue-400" />
+      <span className="text-sm text-[#6a8aaa]">Φόρτωση κατάστασης Drive...</span>
+    </div>
+  );
+
+  const isConnected = status?.configured === true;
+  const hasClient = status?.oauth_client_ready === true;
+  const hasFolder = status?.folder_configured === true;
+
+  return (
+    <div className="glass-card p-6 space-y-4">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Cloud size={16} className="text-blue-400" />
+          <h3 className="section-title">Google Drive</h3>
+        </div>
+        {isConnected ? (
+          <span className="flex items-center gap-1.5 text-[11px] font-medium text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-1 rounded-full">
+            <CheckCircle size={11} /> Συνδεδεμένο
+          </span>
+        ) : (
+          <span className="flex items-center gap-1.5 text-[11px] font-medium text-amber-400 bg-amber-500/10 border border-amber-500/20 px-2.5 py-1 rounded-full">
+            <AlertCircle size={11} /> Αδύνατη σύνδεση
+          </span>
+        )}
+      </div>
+
+      {/* Status checklist */}
+      <div className="space-y-2">
+        {[
+          { label: 'OAuth Client JSON', done: hasClient, step: 1 },
+          { label: 'Εξουσιοδότηση Google Account', done: isConnected, step: 2 },
+          { label: 'Root Φάκελος Drive', done: hasFolder, step: 3 },
+        ].map(s => (
+          <div key={s.step} className="flex items-center gap-3">
+            <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold flex-shrink-0
+              ${s.done ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-[#1a3a5c]/40 text-[#4a6a8a] border border-[#1a3a5c]/50'}`}>
+              {s.done ? '✓' : s.step}
+            </div>
+            <span className={`text-sm ${s.done ? 'text-[#c0d0e0]' : 'text-[#5a7a9a]'}`}>{s.label}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Step 1: Upload OAuth client */}
+      {isAdmin && !hasClient && (
+        <div className="p-4 rounded-xl bg-[#0d2035]/60 border border-[#1a3a5c]/40 space-y-3">
+          <p className="text-xs text-[#8aa0b8]">
+            Κατεβάστε το <strong className="text-[#c0d0e0]">OAuth 2.0 Client JSON</strong> από Google Cloud Console → Credentials και ανεβάστε το εδώ.
+          </p>
+          <label className="btn-dark text-xs flex items-center gap-1.5 cursor-pointer w-fit">
+            <Upload size={13} /> {uploading ? 'Φόρτωση...' : 'Ανέβασε OAuth Client JSON'}
+            <input type="file" accept=".json" className="hidden" onChange={handleOAuthClient} disabled={uploading} />
+          </label>
+        </div>
+      )}
+
+      {/* Step 2: Connect Google Account */}
+      {isAdmin && hasClient && !isConnected && (
+        <div className="p-4 rounded-xl bg-[#0d2035]/60 border border-[#1a3a5c]/40 space-y-3">
+          <p className="text-xs text-[#8aa0b8]">Εξουσιοδοτήστε τον Google λογαριασμό σας για ανέβασμα αρχείων στο Drive.</p>
+          <a href="/api/integrations/gdrive/oauth/start" target="_blank" rel="noopener noreferrer"
+            className="btn-gold text-xs flex items-center gap-1.5 w-fit">
+            <ExternalLink size={13} /> Σύνδεση με Google Drive
+          </a>
+          <p className="text-[11px] text-[#4a6a8a]">Μετά την εξουσιοδότηση, ανανεώστε τη σελίδα.</p>
+        </div>
+      )}
+
+      {/* Step 3: Set folder */}
+      {isAdmin && !hasFolder && (
+        <div className="p-4 rounded-xl bg-[#0d2035]/60 border border-[#1a3a5c]/40 space-y-3">
+          <p className="text-xs text-[#8aa0b8]">Επικολλήστε το URL του φακέλου Google Drive που θέλετε να χρησιμοποιείτε ως root.</p>
+          <div className="flex gap-2">
+            <input value={folderInput} onChange={e => setFolderInput(e.target.value)}
+              placeholder="https://drive.google.com/drive/folders/..." className="input-dark text-xs flex-1" />
+            <button onClick={handleSetFolder} className="btn-dark text-xs flex items-center gap-1 px-3">
+              <FolderOpen size={13} /> Αποθήκευση
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Connected state */}
+      {isConnected && (
+        <div className="p-4 rounded-xl bg-emerald-500/5 border border-emerald-500/20 flex items-start gap-3">
+          <CheckCircle size={16} className="text-emerald-400 flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="text-sm font-medium text-emerald-300">Google Drive συνδεδεμένο</p>
+            <p className="text-xs text-[#6a8aaa] mt-0.5">
+              Τα έγγραφα αρχειοθετούνται αυτόματα: <span className="text-[#8aa0b8]">Έτος → Πελάτης → Υπόθεση</span>
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Re-upload client button when already connected */}
+      {isAdmin && hasClient && (
+        <label className="text-[11px] text-[#4a6a8a] hover:text-[#C6A75E] flex items-center gap-1.5 cursor-pointer w-fit transition-colors">
+          <RefreshCw size={11} /> Αντικατάσταση OAuth client
+          <input type="file" accept=".json" className="hidden" onChange={handleOAuthClient} />
+        </label>
+      )}
+    </div>
+  );
+}
 
 export default function SettingsPage() {
   const [settings, setSettings] = useState<any>({});
@@ -114,24 +268,7 @@ export default function SettingsPage() {
       {activeTab === 'integrations' && (
         <div className="space-y-5">
           {/* Google Drive */}
-          <div className="glass-card p-6 space-y-4">
-            <div className="flex items-center gap-2 mb-2"><Cloud size={16} className="text-blue-400" /><h3 className="section-title">Google Drive</h3></div>
-            <div className="p-3 rounded-xl bg-amber-500/5 border border-amber-500/20">
-              <div className="flex items-center gap-2"><AlertCircle size={13} className="text-amber-400" /><p className="text-xs text-amber-300 font-medium">OAuth Placeholder</p></div>
-              <p className="text-xs text-[#6a8aaa] mt-1">Απαιτείται Google OAuth Client ID & Secret από το Google Cloud Console</p>
-            </div>
-            <div className="grid grid-cols-1 gap-3">
-              <div><label className="label">Google OAuth Client ID</label><input value={settings.google_client_id || ''} onChange={e => setSettings({...settings, google_client_id: e.target.value})} placeholder="xxxx.apps.googleusercontent.com" className="input-dark" disabled={!perms.isAdmin} /></div>
-              <div><label className="label">Google OAuth Client Secret</label><input type="password" value={settings.google_client_secret || ''} onChange={e => setSettings({...settings, google_client_secret: e.target.value})} placeholder="••••••••" className="input-dark" disabled={!perms.isAdmin} /></div>
-            </div>
-            <button
-              onClick={() => toast.info('Ανακατεύθυνση στο Google OAuth... (Placeholder)')}
-              disabled={!perms.isAdmin || !settings.google_client_id}
-              className="btn-dark text-xs flex items-center gap-1.5 disabled:opacity-40">
-              <Link2 size={13} /> Σύνδεση με Google Drive
-            </button>
-            {perms.isAdmin && <button onClick={handleSave} className="btn-gold flex items-center gap-1.5"><Save size={14} /> Αποθήκευση</button>}
-          </div>
+          <GoogleDriveCard isAdmin={perms.isAdmin} />
 
           {/* Lindy AI */}
           <div className="glass-card p-6 space-y-4">

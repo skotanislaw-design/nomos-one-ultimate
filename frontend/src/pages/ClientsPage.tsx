@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Search, Plus, X, Eye, Trash2, Download, Building2, User as UserIcon, AlertTriangle, Phone, Mail, MapPin, Hash, Edit2, Briefcase, ChevronRight } from 'lucide-react';
 import { clientsApi, casesApi, authApi } from '@/lib/api';
+import DocumentScanButton, { ExtractedData } from '@/components/DocumentScanButton';
 import { usePermissions } from '@/hooks/usePermissions';
 import { SegmentTabs } from '@/components/ui/SegmentTabs';
 import { toast } from 'sonner';
@@ -35,6 +36,21 @@ export default function ClientsPage() {
     full_name: '', afm: '', phone: '', email: '', address: '',
     client_type: 'individual' as ClientType,
   });
+  const handleScanExtract = (data: ExtractedData) => {
+    if (data.client) {
+      const cl = data.client;
+      setForm(prev => ({
+        ...prev,
+        full_name: cl.full_name || prev.full_name,
+        afm: cl.afm || prev.afm,
+        phone: cl.phone || prev.phone,
+        email: cl.email || prev.email,
+        address: cl.address || prev.address,
+        client_type: (cl.client_type as any) || prev.client_type,
+      }));
+    }
+  };
+
   const [selectedClient, setSelectedClient] = useState<any>(null);
   const [clientCases, setClientCases] = useState<any[]>([]);
   const [loadingDetail, setLoadingDetail] = useState(false);
@@ -237,6 +253,7 @@ export default function ClientsPage() {
               <button onClick={() => setShowAdd(false)} className="p-2 rounded-lg hover:bg-[#132B45] text-[#7a9ab8]"><X size={18} /></button>
             </div>
             <form onSubmit={handleAdd} className="p-6 space-y-4">
+              <DocumentScanButton onExtracted={handleScanExtract} className="w-full mb-2" />
               <div><label className="label">Ονοματεπώνυμο / Επωνυμία</label><input value={form.full_name} onChange={e => setForm({...form, full_name: e.target.value})} className="input-dark" required /></div>
 
               {/* Client Type */}

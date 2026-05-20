@@ -3,7 +3,7 @@ Nomos One - Law Firm Management System
 Production-ready FastAPI backend — Phase 1 Security Hardened
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Query, Request
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -31,6 +31,7 @@ from pathlib import Path
 # ── PWA & Mobile Services ─────────────────────────────────────────────────────
 from device_service import get_device_service
 from push_service import get_push_service
+from ai_service import extract_document as ai_extract_document, intake_analyze
 
 # ── WebSocket & Real-time Messaging (Phase 1.7) ────────────────────────────────
 from websocket_service import get_websocket_manager
@@ -61,6 +62,7 @@ MIN_PASSWORD_LENGTH = int(os.getenv("MIN_PASSWORD_LENGTH", "8"))
 MAX_LOGIN_ATTEMPTS = int(os.getenv("MAX_LOGIN_ATTEMPTS", "5"))
 LOGIN_LOCKOUT_MINUTES = int(os.getenv("LOGIN_LOCKOUT_MINUTES", "15"))
 STAGNANT_DAYS = int(os.getenv("STAGNANT_DAYS", "30"))
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 # Validate JWT_SECRET at startup
 if not JWT_SECRET or JWT_SECRET.startswith("CHANGE"):
@@ -296,6 +298,279 @@ async def seed_default_admin():
             logger.info(f"Admin created: {ADMIN_EMAIL} (password set via ADMIN_INITIAL_PASSWORD)")
             logger.info("IMPORTANT: Remove ADMIN_INITIAL_PASSWORD from .env after first boot!")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AI INTAKE PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/intake/analyze")
+async def intake_analyze_doc(
+    file: UploadFile = File(...),
+    user=Depends(get_current_user)
+):
+    """Step 1: Upload doc, get AI extraction with confidence/summary/missing fields."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "Η υπηρεσία AI δεν έχει ρυθμιστεί")
+    file_bytes = await file.read()
+    if len(file_bytes) > 20 * 1024 * 1024:
+        raise HTTPException(400, "Το αρχείο είναι πολύ μεγάλο (max 20MB)")
+    media_type = file.content_type or "image/jpeg"
+    try:
+        from ai_service import intake_analyze
+        result = intake_analyze(ANTHROPIC_API_KEY, file_bytes, media_type)
+    except Exception as e:
+        logger.error(f"Intake analyze error: {e}")
+        raise HTTPException(500, f"Σφάλμα ανάλυσης: {str(e)[:200]}")
+    await audit("INTAKE_ANALYZE", user["id"], "document", file.filename or "unknown")
+    return result
+
+
+class IntakeConfirmRequest(BaseModel):
+    extracted: dict
+    file_b64: Optional[str] = None
+    filename: str = "document.pdf"
+    media_type: str = "application/pdf"
+    client_id: Optional[str] = None
+
+
+@app.post("/api/intake/confirm", status_code=201)
+async def intake_confirm(req: IntakeConfirmRequest, user=Depends(get_current_user)):
+    """Step 2: Create client+case+deadlines from confirmed AI data, upload to Drive."""
+    import base64 as b64mod
+    now = datetime.utcnow()
+    result = {}
+
+    # ── 1. Create or find client ──────────────────────────────────────────────
+    cl_data = req.extracted.get("client") or {}
+    client_id_str = None
+    if req.client_id:
+        client_id_str = req.client_id
+        _ec = await db.clients.find_one({"_id": make_id(req.client_id)})
+        result["client"] = {"id": client_id_str,
+                            "full_name": (_ec or {}).get("full_name", ""),
+                            "existing": True}
+    elif cl_data.get("full_name"):
+        # Check if client with same AFM exists
+        existing_client = None
+        if cl_data.get("afm"):
+            existing_client = await db.clients.find_one({"afm": cl_data["afm"]})
+        if not existing_client and cl_data.get("full_name"):
+            existing_client = await db.clients.find_one(
+                {"full_name": {"$regex": cl_data["full_name"][:10], "$options": "i"}}
+            )
+
+        if existing_client:
+            client_id_str = str(existing_client["_id"])
+            result["client"] = {"id": client_id_str, "full_name": existing_client.get("full_name"), "existing": True}
+        else:
+            client_doc = {
+                "full_name": sanitize_string(cl_data.get("full_name", "")),
+                "afm": cl_data.get("afm"),
+                "phone": cl_data.get("phone"),
+                "email": cl_data.get("email"),
+                "address": sanitize_string(cl_data.get("address") or ""),
+                "client_type": cl_data.get("client_type", "individual"),
+                "is_active": True,
+                "source": "ai_intake",
+                "created_at": now,
+                "created_by": user["id"],
+            }
+            cr = await db.clients.insert_one(client_doc)
+            client_id_str = str(cr.inserted_id)
+            await audit("CREATE_CLIENT", user["id"], "client", client_id_str)
+            result["client"] = {"id": client_id_str, "full_name": cl_data.get("full_name"), "existing": False}
+
+    # ── 2. Create case ────────────────────────────────────────────────────────
+    case_data = req.extracted.get("case") or {}
+    case_id_str = None
+    if case_data.get("title") or cl_data.get("full_name"):
+        cn = await case_number_gen()
+        case_title = case_data.get("title") or f"Υπόθεση {cl_data.get('full_name','')}"
+        case_doc = {
+            "title": sanitize_string(case_title),
+            "client_id": client_id_str,
+            "assigned_lawyer_id": user["id"],
+            "status": "active",
+            "legal_category": case_data.get("category", "αστικό"),
+            "court": sanitize_string(case_data.get("court") or ""),
+            "description": sanitize_string(
+                req.extracted.get("summary") or case_data.get("summary") or ""
+            ),
+            "next_action": "",
+            "case_number": cn,
+            "opposing_party": sanitize_string(case_data.get("opposing_party") or ""),
+            "source": "ai_intake",
+            "review_status": "pending_review",
+            "ai_confidence": req.extracted.get("confidence", "low"),
+            "ai_key_facts": req.extracted.get("key_facts", []),
+            "created_at": now,
+            "created_by": user["id"],
+            "updated_at": now,
+            "last_activity": now,
+        }
+        cr2 = await db.cases.insert_one(case_doc)
+        case_id_str = str(cr2.inserted_id)
+        await audit("CREATE_CASE", user["id"], "case", case_id_str)
+        result["case"] = {"id": case_id_str, "case_number": cn, "title": case_title}
+
+    # ── 3. Create deadlines ───────────────────────────────────────────────────
+    deadlines_created = []
+    for dl in (req.extracted.get("deadlines") or []):
+        if not dl.get("title") and not dl.get("due_date"):
+            continue
+        try:
+            dl_date = datetime.fromisoformat(dl["due_date"]) if dl.get("due_date") else now + timedelta(days=30)
+        except Exception:
+            dl_date = now + timedelta(days=30)
+        dl_doc = {
+            "title": sanitize_string(dl.get("title") or "Προθεσμία"),
+            "case_id": case_id_str,
+            "client_id": client_id_str,
+            "date": dl_date,
+            "deadline_type": dl.get("type", "other"),
+            "completed": False,
+            "source": "ai_intake",
+            "created_at": now,
+            "created_by": user["id"],
+        }
+        dr = await db.deadlines.insert_one(dl_doc)
+        deadlines_created.append({"id": str(dr.inserted_id), "title": dl_doc["title"],
+                                   "due_date": dl.get("due_date")})
+        await audit("CREATE_DEADLINE", user["id"], "deadline", str(dr.inserted_id))
+    result["deadlines"] = deadlines_created
+
+    # ── 4. Upload to Google Drive ─────────────────────────────────────────────
+    drive_link = None
+    try:
+        from gdrive_service import is_configured, upload_document
+        if is_configured() and req.file_b64:
+            file_bytes = b64mod.b64decode(req.file_b64)
+            client_name = cl_data.get("full_name", "Άγνωστος") or "Άγνωστος"
+            year = str(now.year)
+            case_number = result.get("case", {}).get("case_number", "")
+            case_title_short = (case_data.get("title") or "Υπόθεση")[:30]
+            case_folder = f"{case_number} - {case_title_short}" if case_number else case_title_short
+            drive_result = upload_document(
+                file_bytes=file_bytes,
+                filename=req.filename or "document.pdf",
+                mime_type=req.media_type,
+                year=year,
+                client_name=client_name[:50],
+                case_folder=case_folder,
+            )
+            drive_link = drive_result.get("folder_link")
+            # Store drive link on case
+            if case_id_str and drive_link:
+                await db.cases.update_one(
+                    {"_id": make_id(case_id_str)},
+                    {"$set": {"drive_folder": drive_link}}
+                )
+            result["drive"] = drive_result
+    except Exception as e:
+        logger.warning(f"Drive upload skipped: {e}")
+        result["drive"] = None
+
+    await audit("INTAKE_CONFIRM", user["id"], "intake", case_id_str or "unknown")
+    return result
+
+
+# ── Google Drive integration management ──────────────────────────────────────
+
+
+@app.post("/api/integrations/gdrive/folder")
+async def gdrive_set_folder(req: dict, user=Depends(require_role(UserRole.ADMIN))):
+    """Save the Drive root folder ID (extracted from URL or raw ID)."""
+    from gdrive_service import set_root_folder_id, get_root_folder_id
+    url_or_id = req.get("folder_id", "").strip()
+    if not url_or_id:
+        raise HTTPException(400, "folder_id is required")
+    # Extract folder ID from URL if full URL provided
+    import re as _re
+    m = _re.search(r"/folders/([a-zA-Z0-9_-]+)", url_or_id)
+    folder_id = m.group(1) if m else url_or_id
+    if len(folder_id) < 10:
+        raise HTTPException(400, "Μη έγκυρο folder ID")
+    set_root_folder_id(folder_id)
+    await audit("GDRIVE_FOLDER", user["id"], "integration", folder_id)
+    return {"ok": True, "folder_id": folder_id}
+
+@app.get("/api/integrations/gdrive/status")
+async def gdrive_status(user=Depends(require_role(UserRole.ADMIN))):
+    try:
+        from gdrive_service import is_configured, is_oauth_client_ready, get_root_folder_id
+        configured = is_configured()
+        client_ready = is_oauth_client_ready()
+        folder_id = get_root_folder_id()
+        return {
+            "configured": configured,
+            "oauth_client_ready": client_ready,
+            "folder_configured": folder_id is not None,
+            "auth_url": "/api/integrations/gdrive/oauth/start" if client_ready and not configured else None,
+        }
+    except Exception as e:
+        return {"configured": False, "error": str(e)}
+
+
+@app.post("/api/integrations/gdrive/oauth/client")
+async def gdrive_upload_oauth_client(
+    file: UploadFile = File(...),
+    user=Depends(require_role(UserRole.ADMIN))
+):
+    from gdrive_service import save_oauth_client
+    content = await file.read()
+    ok = save_oauth_client(content)
+    if not ok:
+        raise HTTPException(400, "Μη εγκυρο OAuth client JSON. Κατεβαστε το απο Google Cloud Console.")
+    await audit("GDRIVE_OAUTH_CLIENT", user["id"], "integration", "gdrive")
+    return {"ok": True, "next": "Visit /api/integrations/gdrive/oauth/start to authorize"}
+
+
+@app.get("/api/integrations/gdrive/oauth/start")
+async def gdrive_oauth_start():
+    from gdrive_service import get_auth_url
+    try:
+        url = get_auth_url()
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/integrations/gdrive/oauth/callback")
+async def gdrive_oauth_callback(code: str = None, error: str = None, state: str = None):
+    if error:
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse(f"<h2>Authorization failed: {error}</h2><p>Close this tab and try again.</p>")
+    if not code:
+        raise HTTPException(400, "Missing authorization code")
+    try:
+        from gdrive_service import exchange_code
+        exchange_code(code)
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse("""<html><body style="font-family:sans-serif;text-align:center;padding:60px">
+        <h2 style="color:#16a34a">&#10003; Google Drive connected!</h2>
+        <p>Authorization successful. You can close this tab and return to Nomos One.</p>
+        <script>setTimeout(()=>window.close(),3000)</script>
+        </body></html>""")
+    except Exception as e:
+        raise HTTPException(500, f"OAuth exchange failed: {str(e)}")
+
+
+@app.post("/api/integrations/gdrive/setup")
+async def gdrive_setup(
+    file: UploadFile = File(...),
+    user=Depends(require_role(UserRole.ADMIN))
+):
+    from gdrive_service import save_credentials, get_service_account_email
+    content = await file.read()
+    ok = save_credentials(content)
+    if not ok:
+        raise HTTPException(400, "Μη εγκυρο αρχειο service account.")
+    email = get_service_account_email()
+    await audit("GDRIVE_SETUP", user["id"], "integration", "gdrive")
+    return {"ok": True, "service_account_email": email}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # AUTH ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -367,9 +642,6 @@ async def get_notifications(user=Depends(get_current_user)):
     notifications = []
 
     inv_query = {"payment_status": {"$in": ["pending", "partial"]}, "due_date": {"$lt": now}}
-    if user["role"] == UserRole.LAWYER.value:
-        case_ids = await db.cases.distinct("_id", {"assigned_lawyer_id": user["id"]})
-        inv_query["case_id"] = {"$in": [str(c) for c in case_ids]}
     overdue_count = await db.invoices.count_documents(inv_query)
     if overdue_count > 0:
         label = "ληξιπρόθεσμο" if overdue_count == 1 else "ληξιπρόθεσμα"
@@ -378,10 +650,6 @@ async def get_notifications(user=Depends(get_current_user)):
 
     end = now + timedelta(days=3)
     dl_query = {"date": {"$gte": now, "$lte": end}, "completed": {"$ne": True}}
-    if user["role"] == UserRole.LAWYER.value:
-        cids = await db.cases.distinct("_id", {"assigned_lawyer_id": user["id"]})
-        cids_str = [str(c) for c in cids]
-        dl_query["$or"] = [{"case_id": {"$in": cids_str}}, {"created_by": user["id"]}]
     urgent = await db.deadlines.find(dl_query).sort("date", 1).limit(3).to_list(None)
     for d in urgent:
         days_left = (d["date"] - now).days
@@ -402,6 +670,83 @@ async def get_notifications(user=Depends(get_current_user)):
     return notifications
 
 
+
+@app.post("/api/ai/extract-document")
+async def ai_extract_doc(
+    file: UploadFile = File(...),
+    document_type: str = Form(default="auto"),
+    user=Depends(get_current_user)
+):
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "Η υπηρεσία AI δεν έχει ρυθμιστεί")
+    file_bytes = await file.read()
+    if len(file_bytes) > 20 * 1024 * 1024:
+        raise HTTPException(400, "Το αρχείο είναι πολύ μεγάλο (max 20MB)")
+    media_type = file.content_type or "image/jpeg"
+    try:
+        result = ai_extract_document(ANTHROPIC_API_KEY, file_bytes, media_type, document_type)
+    except Exception as e:
+        logger.error(f"AI extract error: {e}")
+        raise HTTPException(500, f"Σφάλμα εξαγωγής: {str(e)[:200]}")
+    await audit("AI_EXTRACT", user["id"], "document", file.filename or "unknown")
+    return result
+
+
+
+# ── Nomos AI Bot (Claude) ────────────────────────────────────────────────────
+class BotChatEntry(BaseModel):
+    role: str
+    content: str
+
+class BotChatRequest(BaseModel):
+    message: str
+    history: List[BotChatEntry] = []
+
+@app.post("/api/bot/chat")
+async def bot_chat(req: BotChatRequest, user=Depends(get_current_user)):
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "Η υπηρεσία AI δεν έχει ρυθμιστεί")
+
+    system_prompt = (
+        "Είσαι ο Nomos AI, νομικός βοηθός της δικηγορικής εταιρείας «Σκοτάνης & Συνεργάτες» στη Μύκονο. "
+        "Ειδικεύεσαι στο ελληνικό δίκαιο: ποινικό (ΠΚ, ΚΠΔ), διοικητικό (ΣτΕ, ΔΕφ), "
+        "αστικό (ΑΚ), εμπορικό, εργατικό, περιβαλλοντικό (ΑΕΚΚ, Ν.1650/1986, Ν.4042/2012). "
+        "Απαντάς ΠΑΝΤΑ στα ελληνικά εκτός αν ο χρήστης γράψει σε άλλη γλώσσα. "
+        "Χρησιμοποιείς νομική ορολογία, αναφέρεις νομοθεσία και νομολογία (ΑΠ, ΣτΕ κλπ.) όταν χρειάζεται. "
+        "Είσαι συνοπτικός και πρακτικός. "
+        "Βοηθάς με: σύνταξη δικογράφων/υπομνημάτων, ανάλυση νομικών ζητημάτων, "
+        "εξήγηση νόμων, στρατηγικές υποθέσεων, υπολογισμό προθεσμιών."
+    )
+
+    messages = [
+        {"role": h.role, "content": h.content}
+        for h in req.history[-20:]
+        if h.role in ("user", "assistant") and h.content.strip()
+    ]
+    messages.append({"role": "user", "content": req.message})
+
+    async def stream_response():
+        import anthropic as ant
+        client = ant.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        try:
+            async with client.messages.stream(
+                model="claude-sonnet-4-6",
+                max_tokens=2048,
+                system=system_prompt,
+                messages=messages,
+            ) as stream:
+                async for text in stream.text_stream:
+                    yield f"data: {json.dumps({'text': text})}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.error(f"Bot chat error: {e}")
+            yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
+
+    return StreamingResponse(
+        stream_response(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 @app.post("/api/auth/change-password")
 async def change_password(req: ChangePasswordRequest, user=Depends(get_current_user)):
@@ -871,24 +1216,13 @@ class ClientRequest(BaseModel):
 
 @app.get("/api/clients")
 async def list_clients(user=Depends(get_current_user)):
-    if user["role"] == UserRole.LAWYER.value:
-        cids = await db.cases.distinct("client_id", {"assigned_lawyer_id": user["id"]})
-        oids = []
-        for cid in cids:
-            try: oids.append(ObjectId(cid) if isinstance(cid, str) else cid)
-            except: pass
-        clients = await db.clients.find({"_id": {"$in": oids}}).to_list(None)
-    else:
-        clients = await db.clients.find({}).to_list(None)
+    clients = await db.clients.find({}).to_list(None)
     return [serialize(c) for c in clients]
 
 @app.get("/api/clients/{client_id}")
 async def get_client(client_id: str, user=Depends(get_current_user)):
     doc = await db.clients.find_one({"_id": make_id(client_id)})
     if not doc: raise HTTPException(404, "Ο εντολέας δεν βρέθηκε")
-    if user["role"] == UserRole.LAWYER.value:
-        case = await db.cases.find_one({"client_id": client_id, "assigned_lawyer_id": user["id"]})
-        if not case: raise HTTPException(403, "Δεν έχετε πρόσβαση")
     return serialize(doc)
 
 @app.post("/api/clients", status_code=201)
@@ -958,7 +1292,6 @@ def is_locked(case): return case.get("status") in [CaseStatus.CLOSED.value, Case
 @app.get("/api/cases")
 async def list_cases(user=Depends(get_current_user), status: Optional[str] = None):
     query = {}
-    if user["role"] == UserRole.LAWYER.value: query["assigned_lawyer_id"] = user["id"]
     if status: query["status"] = status
     cases = await db.cases.find(query).sort("created_at", -1).to_list(None)
     result = []
@@ -974,7 +1307,6 @@ async def stagnant_cases(user=Depends(get_current_user)):
     sd = datetime.utcnow() - timedelta(days=STAGNANT_DAYS)
     q = {"status": "active", "$or": [{"last_activity": {"$lt": sd}},
          {"last_activity": {"$exists": False}, "created_at": {"$lt": sd}}]}
-    if user["role"] == UserRole.LAWYER.value: q["assigned_lawyer_id"] = user["id"]
     cases = await db.cases.find(q).to_list(None)
     result = []
     for c in cases:
@@ -984,8 +1316,7 @@ async def stagnant_cases(user=Depends(get_current_user)):
 async def get_case(case_id: str, user=Depends(get_current_user)):
     case = await db.cases.find_one({"_id": make_id(case_id)})
     if not case: raise HTTPException(404, "Η υπόθεση δεν βρέθηκε")
-    if user["role"] == UserRole.LAWYER.value and case.get("assigned_lawyer_id") != user["id"]:
-        raise HTTPException(403, "Δεν έχετε πρόσβαση")
+
     s = serialize(case)
     s["assigned_lawyer_name"] = await get_user_name(s.get("assigned_lawyer_id", ""))
     s["client_name"] = await get_client_name(s.get("client_id", ""))
@@ -1252,8 +1583,7 @@ async def list_lawyers(user=Depends(get_current_user)):
 async def _check_case_access(case_id, user):
     case = await db.cases.find_one({"_id": make_id(case_id)})
     if not case: raise HTTPException(404, "Η υπόθεση δεν βρέθηκε")
-    if user["role"] == UserRole.LAWYER.value and case.get("assigned_lawyer_id") != user["id"]:
-        raise HTTPException(403, "Δεν έχετε πρόσβαση")
+
     return case
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2294,7 +2624,6 @@ async def get_stuck_workflow_cases(days: int = 14, user=Depends(get_current_user
     cutoff = datetime.utcnow() - timedelta(days=days)
     q = {"status": {"$in": ["active","pending"]},
          "$or": [{"updated_at": {"$lt": cutoff}}, {"updated_at": {"$exists": False}, "created_at": {"$lt": cutoff}}]}
-    if user["role"] == UserRole.LAWYER.value: q["assigned_lawyer_id"] = user["id"]
     cases = await db.cases.find(q).to_list(None)
     return [serialize(c) for c in cases]
 
@@ -2302,7 +2631,6 @@ async def get_stuck_workflow_cases(days: int = 14, user=Depends(get_current_user
 async def cases_without_next_action(user=Depends(get_current_user)):
     q = {"status": {"$in": ["active","pending"]},
          "$or": [{"next_action": None},{"next_action": ""},{"next_action": {"$exists": False}}]}
-    if user["role"] == UserRole.LAWYER.value: q["assigned_lawyer_id"] = user["id"]
     cases = await db.cases.find(q).to_list(None)
     return [serialize(c) for c in cases]
 

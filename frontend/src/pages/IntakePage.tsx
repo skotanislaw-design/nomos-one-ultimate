@@ -425,7 +425,7 @@ function DoneStep({ result, onReset }: { result:ConfirmResult; onReset:()=>void 
 }
 
 // ─── Main ──────────────────────────────────────────────────────────────────────
-export default function AIIntakePage() {
+export default function IntakePage() {
   const [step, setStep] = useState<1|2|3>(1);
   const [analysis, setAnalysis] = useState<AnalysisResult|null>(null);
   const [file, setFile] = useState<File|null>(null);

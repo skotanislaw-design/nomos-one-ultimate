@@ -318,4 +318,32 @@ export const adminPortalApi = {
     api.delete(`/api/admin/portal-access/${code_id}`),
 };
 
+
+
+export const intakeApi = {
+  analyze: (file: File) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    return api.post('/api/intake/analyze', fd);
+  },
+  confirm: (payload: { extracted: any; file_b64: string; filename: string; media_type: string }) =>
+    api.post('/api/intake/confirm', payload),
+};
+
+export const gdriveApi = {
+  status: () => api.get('/api/integrations/gdrive/status'),
+  setup: (file: File) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    return api.post('/api/integrations/gdrive/setup', fd);
+  },
+};
+export const aiApi = {
+  extractDocument: (file: File, documentType: string = 'auto') => {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('document_type', documentType);
+    return api.post('/api/ai/extract-document', fd);
+  }
+};
 export default api;

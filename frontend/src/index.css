@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Playfair+Display:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -12,6 +12,7 @@
 }
 
 @layer components {
+  /* Cards */
   .glass-card {
     @apply rounded-xl border border-[#1a3a5c]/50;
     background: linear-gradient(135deg, rgba(19,43,69,0.8), rgba(11,28,45,0.9));
@@ -19,41 +20,64 @@
     box-shadow: 0 4px 24px rgba(0,0,0,0.3), inset 0 1px 0 rgba(198,167,94,0.05);
   }
   .glass-card-hover { @apply glass-card transition-all duration-300 cursor-pointer; }
-  .glass-card-hover:hover { border-color: rgba(198,167,94,0.3); box-shadow: 0 8px 32px rgba(0,0,0,0.4), inset 0 1px 0 rgba(198,167,94,0.1); }
-  .btn-gold { @apply px-4 py-2 rounded-lg font-medium text-sm transition-all duration-200; background: linear-gradient(135deg,#C6A75E,#B8993F); color: #071220; }
+  .glass-card-hover:hover { border-color: rgba(198,167,94,0.3); box-shadow: 0 8px 32px rgba(0,0,0,0.4), inset 0 1px 0 rgba(198,167,94,0.1); transform: translateY(-1px); }
+
+  /* Buttons */
+  .btn-gold { @apply px-4 py-2 rounded-lg font-medium text-sm transition-all duration-200 cursor-pointer; background: linear-gradient(135deg,#C6A75E,#B8993F); color: #071220; }
   .btn-gold:hover { background: linear-gradient(135deg,#E8C97A,#C6A75E); box-shadow: 0 4px 16px rgba(198,167,94,0.3); }
-  .btn-gold:disabled { opacity: 0.5; cursor: not-allowed; }
-  .btn-dark { @apply px-4 py-2 rounded-lg font-medium text-sm transition-all duration-200 border border-[#1a3a5c]; background: rgba(19,43,69,0.6); color: #d4dce8; }
+  .btn-gold:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+  .btn-dark { @apply px-4 py-2 rounded-lg font-medium text-sm transition-all duration-200 border border-[#1a3a5c] cursor-pointer; background: rgba(19,43,69,0.6); color: #d4dce8; }
   .btn-dark:hover { border-color: #C6A75E; background: rgba(19,43,69,0.9); }
+
+  /* Inputs */
   .input-dark { @apply w-full px-3 py-2 rounded-lg text-sm border border-[#1a3a5c] bg-[#0B1C2D] text-[#d4dce8] placeholder-[#5a7a9a] focus:outline-none focus:border-[#C6A75E] focus:ring-1 focus:ring-[#C6A75E]/30 transition-all duration-200; }
+
+  /* Tables */
   .table-premium thead th { @apply text-xs font-semibold uppercase tracking-wider text-[#8aa0b8] px-4 py-3 text-left border-b border-[#1a3a5c]/50; }
   .table-premium tbody td { @apply px-4 py-3 text-sm text-[#c0d0e0] border-b border-[#132B45]/50; }
-  .table-premium tbody tr { @apply transition-colors duration-150; }
+  .table-premium tbody tr { @apply transition-colors duration-150 cursor-pointer; }
   .table-premium tbody tr:hover { background: rgba(19,43,69,0.5); }
+
+  /* Badges */
   .status-badge { @apply px-2.5 py-0.5 rounded-full text-xs font-medium; }
   .status-active { @apply status-badge bg-emerald-500/15 text-emerald-400 border border-emerald-500/20; }
   .status-pending { @apply status-badge bg-amber-500/15 text-amber-400 border border-amber-500/20; }
   .status-closed { @apply status-badge bg-slate-500/15 text-slate-400 border border-slate-500/20; }
   .status-urgent { @apply status-badge bg-red-500/15 text-red-400 border border-red-500/20; }
   .status-info { @apply status-badge bg-blue-500/15 text-blue-400 border border-blue-500/20; }
-  .page-title { @apply text-xl font-bold text-white; font-family: 'Playfair Display', serif; }
+
+  /* Typography */
+  .page-title { @apply text-xl font-semibold text-white tracking-tight; font-family: 'EB Garamond', Georgia, serif; }
   .page-subtitle { @apply text-xs text-[#6a8aaa]; }
-  .section-title { @apply text-sm font-semibold text-[#d4dce8] uppercase tracking-wider; }
-  .label { @apply block text-xs text-[#8aa0b8] mb-1.5 uppercase tracking-wider; }
+  .section-title { @apply text-xs font-semibold text-[#8aa0b8] uppercase tracking-[0.12em]; }
+  .label { @apply block text-xs text-[#8aa0b8] mb-1.5 uppercase tracking-wider font-medium; }
+
+  /* Nav section header */
+  .nav-section-label { @apply text-[9px] font-bold uppercase tracking-[0.18em] text-[#3a5a7a] px-3 mt-5 mb-1.5 block; }
+
+  /* Gold divider */
+  .gold-divider { @apply h-px my-4; background: linear-gradient(90deg, transparent, rgba(198,167,94,0.2), transparent); }
 }
 
-/* ── Print styles: only the element with id="nomos-print-area" is printed ── */
+/* ── Animations ── */
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in-up { animation: fadeInUp 0.4s ease forwards; }
+
+@keyframes shimmer {
+  0% { background-position: -200% center; }
+  100% { background-position: 200% center; }
+}
+
+/* ── Print ── */
 @media print {
   body * { visibility: hidden !important; }
   #nomos-print-area, #nomos-print-area * { visibility: visible !important; }
   #nomos-print-area {
-    position: fixed !important;
-    inset: 0 !important;
-    z-index: 9999 !important;
-    background: white !important;
-    padding: 0 !important;
-    margin: 0 !important;
+    position: fixed !important; inset: 0 !important; z-index: 9999 !important;
+    background: white !important; padding: 0 !important; margin: 0 !important;
   }
-  /* ensure dark backgrounds render in print */
   * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
 }
