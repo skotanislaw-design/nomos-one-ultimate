@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Search, Plus, X, Eye, Trash2, Download, AlertTriangle, ArrowUpDown } from 'lucide-react';
+import { Search, Plus, X, Eye, Trash2, Download, AlertTriangle, ArrowUpDown, FileText, CheckCircle, XCircle, Clock } from 'lucide-react';
 import { casesApi, clientsApi } from '@/lib/api';
+import api from '@/lib/api';
 import DocumentScanButton, { ExtractedData } from '@/components/DocumentScanButton';
 import { usePermissions } from '@/hooks/usePermissions';
 import { SegmentTabs } from '@/components/ui/SegmentTabs';
@@ -16,7 +17,7 @@ const STATUS_LABELS: Record<string, string> = {
   closed_settled: 'Συμβιβασμός', archived: 'Αρχείο',
 };
 
-type StatusTab = 'all' | 'open' | 'in_progress' | 'hearing' | 'appeal' | 'closed';
+type StatusTab = 'all' | 'open' | 'in_progress' | 'hearing' | 'appeal' | 'closed' | 'pending';
 type SortKey = 'title' | 'client_name' | 'category' | 'status' | 'created_at';
 
 export default function CasesPage() {
@@ -31,6 +32,32 @@ export default function CasesPage() {
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [sortKey, setSortKey] = useState<SortKey>('created_at');
   const [sortAsc, setSortAsc] = useState(false);
+  const [pendingIntakes, setPendingIntakes] = useState<any[]>([]);
+  const [summaryCase, setSummaryCase] = useState<any>(null);
+  const [approvingId, setApprovingId] = useState<string | null>(null);
+
+  const loadPending = () => {
+    api.get('/api/pending-intakes').then(r => setPendingIntakes(Array.isArray(r.data) ? r.data : [])).catch(() => {});
+  };
+
+  const handleApprove = async (id: string) => {
+    setApprovingId(id);
+    try {
+      const r = await api.post(`/api/pending-intakes/${id}/approve`);
+      toast.success(`Εγκρίθηκε! Υπόθεση ${r.data.case_number}`);
+      loadPending(); load();
+    } catch (err: any) { toast.error(err.response?.data?.detail || 'Σφάλμα'); }
+    finally { setApprovingId(null); }
+  };
+
+  const handleReject = async (id: string) => {
+    try {
+      await api.post(`/api/pending-intakes/${id}/reject`, { notes: '' });
+      toast.success('Απορρίφθηκε');
+      loadPending();
+    } catch (err: any) { toast.error(err.response?.data?.detail || 'Σφάλμα'); }
+  };
+
   const handleScanExtract = (data: ExtractedData) => {
     if (data.case) {
       const cs = data.case;
@@ -51,7 +78,7 @@ export default function CasesPage() {
       .then(([c, cl]) => { setCases(Array.isArray(c.data) ? c.data : []); setClients(Array.isArray(cl.data) ? cl.data : []); setLoading(false); })
       .catch(() => setLoading(false));
   };
-  useEffect(load, []);
+  useEffect(() => { load(); loadPending(); }, []);
 
   const filtered = cases
     .filter(c => {
@@ -76,7 +103,8 @@ export default function CasesPage() {
     { id: 'all', label: 'Όλες' }, { id: 'open', label: 'Ανοικτές' },
     { id: 'in_progress', label: 'Σε Εξέλιξη' }, { id: 'hearing', label: 'Ακροαματήριο' },
     { id: 'appeal', label: 'Έφεση' }, { id: 'closed', label: 'Κλειστές' },
-  ].map(t => ({ ...t, count: count(t.id) }));
+    { id: 'pending', label: `Εκκρεμείς${pendingIntakes.length > 0 ? ` (${pendingIntakes.length})` : ''}` },
+  ].map(t => ({ ...t, count: t.id === 'pending' ? pendingIntakes.length : count(t.id) }));
 
   const handleAdd = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -155,6 +183,66 @@ export default function CasesPage() {
         </div>
       </div>
 
+      {/* Pending intakes tab */}
+      {activeTab === 'pending' ? (
+        <div className="space-y-3">
+          {pendingIntakes.length === 0 && (
+            <div className="glass-card py-14 text-center text-[#5a7a9a] text-sm">
+              <Clock size={32} className="mx-auto mb-3 opacity-30" />
+              Δεν υπάρχουν εκκρεμείς αιτήσεις.
+            </div>
+          )}
+          {pendingIntakes.map(pi => {
+            const ext = pi.extracted || {};
+            const cs = ext.case || {};
+            const conf = ext.confidence || 'low';
+            const confColor = conf === 'high' ? 'text-green-400' : conf === 'medium' ? 'text-yellow-400' : 'text-red-400';
+            const isPending = pi.status === 'pending';
+            return (
+              <div key={pi._id} className="glass-card p-4 border border-[#1a3a5c]/60">
+                <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${isPending ? 'border-yellow-500/40 text-yellow-400 bg-yellow-500/10' : 'border-red-500/40 text-red-400 bg-red-500/10'}`}>
+                        {isPending ? 'ΕΚΚΡΕΜΕΙ' : 'ΑΠΟΡΡΙΦΘΗΚΕ'}
+                      </span>
+                      <span className={`text-[10px] font-mono ${confColor}`}>AI: {conf}</span>
+                      <span className="text-[10px] text-[#5a7a9a]">{pi.source?.toUpperCase()} · {pi.submitted_by}</span>
+                    </div>
+                    <p className="font-semibold text-[#d4dce8] truncate">👤 {pi.client_name}</p>
+                    <p className="text-xs text-[#8aa0b8] truncate mt-0.5">📁 {cs.title || '—'}</p>
+                    {ext.summary && <p className="text-xs text-[#5a7a9a] mt-1 line-clamp-2">{ext.summary}</p>}
+                    <div className="flex flex-wrap gap-1 mt-2">
+                      {(pi.filenames || []).map((f: string) => (
+                        <span key={f} className="text-[10px] px-1.5 py-0.5 rounded bg-[#0d2035] text-[#5a7a9a] border border-[#1a3a5c]/40 font-mono truncate max-w-[150px]">{f}</span>
+                      ))}
+                    </div>
+                    {(ext.key_facts || []).length > 0 && (
+                      <ul className="mt-2 space-y-0.5">
+                        {ext.key_facts.slice(0, 3).map((f: string, i: number) => (
+                          <li key={i} className="text-[10px] text-[#6a8aaa] flex gap-1"><span className="text-[#C6A75E]">·</span>{f}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                  {isPending && (
+                    <div className="flex sm:flex-col gap-2 shrink-0">
+                      <button onClick={() => handleApprove(pi._id)} disabled={approvingId === pi._id}
+                        className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-green-500/15 border border-green-500/30 text-green-400 text-xs font-semibold hover:bg-green-500/25 transition-all disabled:opacity-40">
+                        <CheckCircle size={13} />{approvingId === pi._id ? '...' : 'Έγκριση'}
+                      </button>
+                      <button onClick={() => handleReject(pi._id)}
+                        className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-red-500/15 border border-red-500/30 text-red-400 text-xs font-semibold hover:bg-red-500/25 transition-all">
+                        <XCircle size={13} />Απόρριψη
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
       <div className="glass-card overflow-hidden">
         <table className="w-full table-premium">
           <thead>
@@ -182,6 +270,10 @@ export default function CasesPage() {
                 <td><span className={STATUS_MAP[c.status] || 'status-pending'}>{STATUS_LABELS[c.status] || c.status}</span></td>
                 <td>
                   <div className="flex items-center gap-1">
+                    <button onClick={() => setSummaryCase(c)} title="Σύνοψη"
+                      className="p-1.5 rounded hover:bg-[#132B45] text-[#7a9ab8] hover:text-[#C6A75E] transition-all">
+                      <FileText size={14} />
+                    </button>
                     <button onClick={() => nav(`/cases/${c._id || c.id}`)} title="Προβολή"
                       className="p-1.5 rounded hover:bg-[#132B45] text-[#7a9ab8] hover:text-[#C6A75E] transition-all">
                       <Eye size={14} />
@@ -200,6 +292,53 @@ export default function CasesPage() {
         </table>
         {filtered.length === 0 && <div className="py-12 text-center text-[#5a7a9a] text-sm">Δεν βρέθηκαν υποθέσεις.</div>}
       </div>
+      )}
+
+      {/* Case Summary Modal */}
+      {summaryCase && (
+        <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" onClick={() => setSummaryCase(null)}>
+          <div className="glass-card w-full max-w-lg border border-[#1a3a5c] max-h-[85vh] flex flex-col" onClick={e => e.stopPropagation()}>
+            <div className="p-5 border-b border-[#1a3a5c]/40 flex items-start justify-between gap-3 shrink-0">
+              <div className="min-w-0">
+                <p className="text-[10px] font-mono text-[#C6A75E] mb-1">{summaryCase.case_number || '—'}</p>
+                <h3 className="text-base font-bold text-white leading-tight">{summaryCase.title}</h3>
+                <p className="text-xs text-[#7a9ab8] mt-0.5">{summaryCase.client_name || '—'}</p>
+              </div>
+              <button onClick={() => setSummaryCase(null)} className="p-1.5 rounded-lg hover:bg-[#132B45] text-[#7a9ab8] shrink-0"><X size={16} /></button>
+            </div>
+            <div className="p-5 overflow-y-auto space-y-4">
+              {summaryCase.description && (
+                <div>
+                  <p className="text-[10px] uppercase tracking-wider text-[#5a7a9a] font-semibold mb-1.5">Περιγραφή</p>
+                  <p className="text-sm text-[#b0c4d8] leading-relaxed">{summaryCase.description}</p>
+                </div>
+              )}
+              {(summaryCase.ai_key_facts || []).length > 0 && (
+                <div>
+                  <p className="text-[10px] uppercase tracking-wider text-[#5a7a9a] font-semibold mb-1.5">Βασικά Γεγονότα (AI)</p>
+                  <ul className="space-y-1.5">
+                    {summaryCase.ai_key_facts.map((f: string, i: number) => (
+                      <li key={i} className="flex gap-2 text-sm text-[#8aa0b8]">
+                        <span className="text-[#C6A75E] shrink-0 mt-0.5">·</span>{f}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-3 pt-1">
+                {summaryCase.court && <div><p className="text-[10px] text-[#5a7a9a] uppercase tracking-wider">Δικαστήριο</p><p className="text-xs text-[#b0c4d8] mt-0.5">{summaryCase.court}</p></div>}
+                {summaryCase.opposing_party && <div><p className="text-[10px] text-[#5a7a9a] uppercase tracking-wider">Αντίδικος</p><p className="text-xs text-[#b0c4d8] mt-0.5">{summaryCase.opposing_party}</p></div>}
+                {summaryCase.legal_category && <div><p className="text-[10px] text-[#5a7a9a] uppercase tracking-wider">Κατηγορία</p><p className="text-xs text-[#b0c4d8] mt-0.5">{summaryCase.legal_category}</p></div>}
+                {summaryCase.ai_confidence && <div><p className="text-[10px] text-[#5a7a9a] uppercase tracking-wider">Αξιοπιστία AI</p><p className={`text-xs mt-0.5 font-semibold ${summaryCase.ai_confidence==='high'?'text-green-400':summaryCase.ai_confidence==='medium'?'text-yellow-400':'text-red-400'}`}>{summaryCase.ai_confidence}</p></div>}
+              </div>
+            </div>
+            <div className="p-4 border-t border-[#1a3a5c]/40 shrink-0">
+              <button onClick={() => { setSummaryCase(null); nav(`/cases/${summaryCase._id || summaryCase.id}`); }}
+                className="btn-gold w-full text-xs">Άνοιγμα Υπόθεσης</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Add modal */}
       {showAdd && (
