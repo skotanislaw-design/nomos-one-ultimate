@@ -232,122 +232,6 @@ async def shutdown():
     client.close()
 
 
-# ── Pending Intakes (Telegram / Email intake queue) ───────────────────────────
-
-@app.get("/api/pending-intakes")
-async def list_pending_intakes(user=Depends(get_current_user)):
-    items = await db.pending_intakes.find(
-        {"status": {"$in": ["pending", "rejected"]}}
-    ).sort("submitted_at", -1).to_list(100)
-    return [serialize(i) for i in items]
-
-
-@app.post("/api/pending-intakes/{intake_id}/approve")
-async def approve_pending_intake(intake_id: str, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER))):
-    intake = await db.pending_intakes.find_one({"_id": make_id(intake_id)})
-    if not intake:
-        raise HTTPException(404, "Δεν βρέθηκε")
-    if intake["status"] == "approved":
-        raise HTTPException(400, "Έχει ήδη εγκριθεί")
-
-    now = datetime.utcnow()
-    extracted = intake.get("extracted") or {}
-    cl = extracted.get("client") or {}
-    cs = extracted.get("case") or {}
-
-    # Create client
-    client_name = intake.get("client_name") or cl.get("full_name", "Άγνωστος")
-    existing_client = None
-    if cl.get("afm"):
-        existing_client = await db.clients.find_one({"afm": cl["afm"]})
-    if not existing_client and client_name:
-        existing_client = await db.clients.find_one(
-            {"full_name": {"$regex": client_name[:10], "$options": "i"}}
-        )
-
-    if existing_client:
-        client_id = str(existing_client["_id"])
-    else:
-        client_doc = {
-            "full_name": client_name,
-            "afm": cl.get("afm"),
-            "phone": cl.get("phone", ""),
-            "email": cl.get("email", ""),
-            "address": cl.get("address", ""),
-            "client_type": cl.get("client_type", "individual"),
-            "is_active": True,
-            "source": "intake_channel",
-            "created_at": now,
-            "created_by": user["id"],
-        }
-        cr = await db.clients.insert_one(client_doc)
-        client_id = str(cr.inserted_id)
-        await audit("CREATE_CLIENT", user["id"], "client", client_id)
-
-    # Create case
-    cn = await case_number_gen()
-    case_title = cs.get("title") or f"Υπόθεση {client_name}"
-    case_doc = {
-        "title": case_title,
-        "client_id": client_id,
-        "assigned_lawyer_id": user["id"],
-        "status": "active",
-        "legal_category": cs.get("category", "αστικό"),
-        "court": cs.get("court", ""),
-        "description": extracted.get("summary") or cs.get("summary", ""),
-        "case_number": cn,
-        "opposing_party": cs.get("opposing_party", ""),
-        "source": "intake_channel",
-        "review_status": "approved",
-        "ai_confidence": extracted.get("confidence", "low"),
-        "ai_key_facts": extracted.get("key_facts", []),
-        "source_files": intake.get("filenames", []),
-        "created_at": now,
-        "created_by": user["id"],
-        "updated_at": now,
-        "last_activity": now,
-    }
-    cr2 = await db.cases.insert_one(case_doc)
-    case_id = str(cr2.inserted_id)
-    await audit("CREATE_CASE", user["id"], "case", case_id)
-
-    # Mark intake as approved
-    await db.pending_intakes.update_one(
-        {"_id": make_id(intake_id)},
-        {"$set": {
-            "status": "approved",
-            "reviewed_by": user["id"],
-            "reviewed_at": now,
-            "created_client_id": client_id,
-            "created_case_id": case_id,
-            "created_case_number": cn,
-        }}
-    )
-
-    return {"status": "approved", "case_number": cn, "case_id": case_id, "client_id": client_id}
-
-
-@app.post("/api/pending-intakes/{intake_id}/reject")
-async def reject_pending_intake(
-    intake_id: str,
-    body: dict = {},
-    user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER))
-):
-    intake = await db.pending_intakes.find_one({"_id": make_id(intake_id)})
-    if not intake:
-        raise HTTPException(404, "Δεν βρέθηκε")
-
-    await db.pending_intakes.update_one(
-        {"_id": make_id(intake_id)},
-        {"$set": {
-            "status": "rejected",
-            "reviewed_by": user["id"],
-            "reviewed_at": datetime.utcnow(),
-            "notes": body.get("notes", ""),
-        }}
-    )
-    return {"status": "rejected"}
-
 # ── Enums ─────────────────────────────────────────────────────────────────────
 class UserRole(str, Enum):
     ADMIN = "administrator"
@@ -1662,6 +1546,118 @@ async def case_number_gen():
     return f"{year}-{str(result['seq']).zfill(4)}"
 
 def is_locked(case): return case.get("status") in [CaseStatus.CLOSED.value, CaseStatus.ARCHIVED.value]
+
+
+# ── Pending Intakes (Telegram / Email intake queue) ───────────────────────────
+
+@app.get("/api/pending-intakes")
+async def list_pending_intakes(user=Depends(get_current_user)):
+    items = await db.pending_intakes.find(
+        {"status": {"$in": ["pending", "rejected"]}}
+    ).sort("submitted_at", -1).to_list(100)
+    return [serialize(i) for i in items]
+
+
+@app.post("/api/pending-intakes/{intake_id}/approve")
+async def approve_pending_intake(intake_id: str, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER))):
+    intake = await db.pending_intakes.find_one({"_id": make_id(intake_id)})
+    if not intake:
+        raise HTTPException(404, "Δεν βρέθηκε")
+    if intake["status"] == "approved":
+        raise HTTPException(400, "Έχει ήδη εγκριθεί")
+
+    now = datetime.utcnow()
+    extracted = intake.get("extracted") or {}
+    cl = extracted.get("client") or {}
+    cs = extracted.get("case") or {}
+
+    client_name = intake.get("client_name") or cl.get("full_name", "Άγνωστος")
+    existing_client = None
+    if cl.get("afm"):
+        existing_client = await db.clients.find_one({"afm": cl["afm"]})
+    if not existing_client and client_name:
+        existing_client = await db.clients.find_one(
+            {"full_name": {"$regex": client_name[:10], "$options": "i"}}
+        )
+
+    if existing_client:
+        client_id = str(existing_client["_id"])
+    else:
+        client_doc = {
+            "full_name": client_name,
+            "afm": cl.get("afm"),
+            "phone": cl.get("phone", ""),
+            "email": cl.get("email", ""),
+            "address": cl.get("address", ""),
+            "client_type": cl.get("client_type", "individual"),
+            "is_active": True,
+            "source": "intake_channel",
+            "created_at": now,
+            "created_by": user["id"],
+        }
+        cr = await db.clients.insert_one(client_doc)
+        client_id = str(cr.inserted_id)
+        await audit("CREATE_CLIENT", user["id"], "client", client_id)
+
+    cn = await case_number_gen()
+    case_title = cs.get("title") or f"Υπόθεση {client_name}"
+    case_doc = {
+        "title": case_title,
+        "client_id": client_id,
+        "assigned_lawyer_id": user["id"],
+        "status": "active",
+        "legal_category": cs.get("category", "αστικό"),
+        "court": cs.get("court", ""),
+        "description": extracted.get("summary") or cs.get("summary", ""),
+        "case_number": cn,
+        "opposing_party": cs.get("opposing_party", ""),
+        "source": "intake_channel",
+        "review_status": "approved",
+        "ai_confidence": extracted.get("confidence", "low"),
+        "ai_key_facts": extracted.get("key_facts", []),
+        "source_files": intake.get("filenames", []),
+        "created_at": now,
+        "created_by": user["id"],
+        "updated_at": now,
+        "last_activity": now,
+    }
+    cr2 = await db.cases.insert_one(case_doc)
+    case_id = str(cr2.inserted_id)
+    await audit("CREATE_CASE", user["id"], "case", case_id)
+
+    await db.pending_intakes.update_one(
+        {"_id": make_id(intake_id)},
+        {"$set": {
+            "status": "approved",
+            "reviewed_by": user["id"],
+            "reviewed_at": now,
+            "created_client_id": client_id,
+            "created_case_id": case_id,
+            "created_case_number": cn,
+        }}
+    )
+    return {"status": "approved", "case_number": cn, "case_id": case_id, "client_id": client_id}
+
+
+@app.post("/api/pending-intakes/{intake_id}/reject")
+async def reject_pending_intake(
+    intake_id: str,
+    body: dict = {},
+    user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER))
+):
+    intake = await db.pending_intakes.find_one({"_id": make_id(intake_id)})
+    if not intake:
+        raise HTTPException(404, "Δεν βρέθηκε")
+    await db.pending_intakes.update_one(
+        {"_id": make_id(intake_id)},
+        {"$set": {
+            "status": "rejected",
+            "reviewed_by": user["id"],
+            "reviewed_at": datetime.utcnow(),
+            "notes": body.get("notes", ""),
+        }}
+    )
+    return {"status": "rejected"}
 
 @app.get("/api/cases")
 async def list_cases(user=Depends(get_current_user), status: Optional[str] = None):
