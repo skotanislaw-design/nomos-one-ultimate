@@ -199,7 +199,7 @@ export default function CasesPage() {
             const confColor = conf === 'high' ? 'text-green-400' : conf === 'medium' ? 'text-yellow-400' : 'text-red-400';
             const isPending = pi.status === 'pending';
             return (
-              <div key={pi._id} className="glass-card p-4 border border-[#1a3a5c]/60">
+              <div key={pi.id || pi._id} className="glass-card p-4 border border-[#1a3a5c]/60">
                 <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 mb-1">
@@ -227,11 +227,11 @@ export default function CasesPage() {
                   </div>
                   {isPending && (
                     <div className="flex sm:flex-col gap-2 shrink-0">
-                      <button onClick={() => handleApprove(pi._id)} disabled={approvingId === pi._id}
+                      <button onClick={() => handleApprove(pi.id || pi._id)} disabled={approvingId === pi.id || pi._id}
                         className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-green-500/15 border border-green-500/30 text-green-400 text-xs font-semibold hover:bg-green-500/25 transition-all disabled:opacity-40">
-                        <CheckCircle size={13} />{approvingId === pi._id ? '...' : 'Έγκριση'}
+                        <CheckCircle size={13} />{approvingId === pi.id || pi._id ? '...' : 'Έγκριση'}
                       </button>
-                      <button onClick={() => handleReject(pi._id)}
+                      <button onClick={() => handleReject(pi.id || pi._id)}
                         className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-red-500/15 border border-red-500/30 text-red-400 text-xs font-semibold hover:bg-red-500/25 transition-all">
                         <XCircle size={13} />Απόρριψη
                       </button>
