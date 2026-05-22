@@ -129,12 +129,56 @@ PROMPTS = {
 
 def _parse_json(text: str) -> dict:
     text = text.strip()
+    # Strip markdown fences
     text = re.sub(r'^```(?:json)?\s*', '', text)
-    text = re.sub(r'\s*```$', '', text)
-    m = re.search(r'\{.*\}', text, re.DOTALL)
-    if m:
-        return json.loads(m.group())
-    raise ValueError("No JSON found in response")
+    text = re.sub(r'\s*```\s*$', '', text)
+
+    # 1. Direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Find outermost { } and try raw_decode (stops at first valid JSON)
+    start = text.find('{')
+    if start != -1:
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(text, start)
+            return obj
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Fix common LLM issues: trailing commas before } or ]
+    cleaned = re.sub(r',\s*([}\]])', r'\1', text)
+    start = cleaned.find('{')
+    if start != -1:
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(cleaned, start)
+            return obj
+        except json.JSONDecodeError:
+            pass
+
+    # 4. Truncated JSON — try to close unclosed braces/brackets
+    snippet = text[text.find('{'):] if '{' in text else text
+    # Count unclosed braces
+    depth_brace = snippet.count('{') - snippet.count('}')
+    depth_bracket = snippet.count('[') - snippet.count(']')
+    # Remove trailing incomplete string or comma
+    snippet = re.sub(r',?\s*"[^"]*$', '', snippet)
+    snippet = re.sub(r',\s*$', '', snippet)
+    snippet += ']' * max(0, depth_bracket) + '}' * max(0, depth_brace)
+    try:
+        return json.loads(snippet)
+    except json.JSONDecodeError:
+        pass
+
+    # 5. Fallback: return safe empty structure so the flow doesn't break
+    logger.warning(f"_parse_json: could not parse, returning skeleton. Text[:200]: {text[:200]}")
+    return {
+        "document_type": "other", "confidence": "low",
+        "summary": "", "key_facts": [],
+        "client": {}, "case": {}, "deadlines": [],
+    }
 
 
 def extract_document(api_key: str, file_bytes: bytes, media_type: str,
@@ -160,7 +204,7 @@ def extract_document(api_key: str, file_bytes: bytes, media_type: str,
     client = anthropic.Anthropic(api_key=api_key)
     resp = client.messages.create(
         model=model,
-        max_tokens=3000,
+        max_tokens=4096,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": [
             file_block,
