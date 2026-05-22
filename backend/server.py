@@ -153,6 +153,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Intake channel routers (registered at module level so routes are available immediately)
+app.include_router(telegram_router)
+
 # ── DB ────────────────────────────────────────────────────────────────────────
 client: AsyncIOMotorClient = None
 db = None
@@ -216,7 +219,6 @@ async def startup():
     await seed_default_admin()
 
     # ── Intake channels: Telegram & Email ────────────────────────────────────
-    app.include_router(telegram_router)
     base_url = os.getenv("BASE_URL", "https://nomos.skotanislaw.gr")
     await register_webhook(base_url)
     asyncio.create_task(email_intake_loop(db, ANTHROPIC_API_KEY, MODEL_EXTRACTION))
