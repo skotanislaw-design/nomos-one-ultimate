@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from bson import ObjectId
 from bson.errors import InvalidId
 from collections import defaultdict
+import asyncio
 import jwt
 import bcrypt
 import os
@@ -41,6 +42,8 @@ from email_service import send_otp_email
 # ── WebSocket & Real-time Messaging (Phase 1.7) ────────────────────────────────
 from websocket_service import get_websocket_manager
 from websocket_routes import router as ws_router, set_jwt_secret
+from telegram_intake_service import router as telegram_router, register_webhook
+from email_intake_service import email_intake_loop
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -211,6 +214,12 @@ async def startup():
 
     logger.info("Database connected and indexes created")
     await seed_default_admin()
+
+    # ── Intake channels: Telegram & Email ────────────────────────────────────
+    app.include_router(telegram_router)
+    base_url = os.getenv("BASE_URL", "https://nomos.skotanislaw.gr")
+    await register_webhook(base_url)
+    asyncio.create_task(email_intake_loop(db, ANTHROPIC_API_KEY, MODEL_EXTRACTION))
 
 @app.on_event("shutdown")
 async def shutdown():
