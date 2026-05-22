@@ -138,7 +138,8 @@ def _parse_json(text: str) -> dict:
 
 
 def extract_document(api_key: str, file_bytes: bytes, media_type: str,
-                     document_type: str = "auto") -> dict:
+                     document_type: str = "auto",
+                     model: str = "claude-haiku-4-5-20251001") -> dict:
     import anthropic
     prompt = PROMPTS.get(document_type, PROMPTS["auto"])
     b64 = base64.standard_b64encode(file_bytes).decode()
@@ -158,7 +159,7 @@ def extract_document(api_key: str, file_bytes: bytes, media_type: str,
 
     client = anthropic.Anthropic(api_key=api_key)
     resp = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=model,
         max_tokens=3000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": [
@@ -167,12 +168,13 @@ def extract_document(api_key: str, file_bytes: bytes, media_type: str,
         ]}]
     )
     raw = resp.content[0].text
-    logger.info(f"AI extract raw: {raw[:300]}")
+    logger.info(f"AI extract raw [{model}]: {raw[:300]}")
     data = _parse_json(raw)
     data["_tokens"] = resp.usage.input_tokens + resp.usage.output_tokens
     return data
 
 
-def intake_analyze(api_key: str, file_bytes: bytes, media_type: str) -> dict:
+def intake_analyze(api_key: str, file_bytes: bytes, media_type: str,
+                   model: str = "claude-haiku-4-5-20251001") -> dict:
     """Full intake extraction with confidence, summary, key_facts, missing_fields."""
-    return extract_document(api_key, file_bytes, media_type, "intake")
+    return extract_document(api_key, file_bytes, media_type, "intake", model=model)

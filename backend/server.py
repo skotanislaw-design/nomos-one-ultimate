@@ -68,6 +68,9 @@ MAX_LOGIN_ATTEMPTS = int(os.getenv("MAX_LOGIN_ATTEMPTS", "5"))
 LOGIN_LOCKOUT_MINUTES = int(os.getenv("LOGIN_LOCKOUT_MINUTES", "15"))
 STAGNANT_DAYS = int(os.getenv("STAGNANT_DAYS", "30"))
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# Model routing: Haiku for bulk extraction (cheap), Sonnet for legal reasoning & chat (quality)
+MODEL_EXTRACTION = "claude-haiku-4-5-20251001"
+MODEL_CHAT = "claude-sonnet-4-6"
 
 # Validate JWT_SECRET at startup
 if not JWT_SECRET or JWT_SECRET.startswith("CHANGE"):
@@ -336,7 +339,7 @@ async def intake_analyze_doc(
     media_type = file.content_type or "image/jpeg"
     try:
         from ai_service import intake_analyze
-        result = intake_analyze(ANTHROPIC_API_KEY, file_bytes, media_type)
+        result = intake_analyze(ANTHROPIC_API_KEY, file_bytes, media_type, model=MODEL_EXTRACTION)
     except Exception as e:
         logger.error(f"Intake analyze error: {e}")
         raise HTTPException(500, f"Σφάλμα ανάλυσης: {str(e)[:200]}")
@@ -923,7 +926,7 @@ async def ai_extract_doc(
         raise HTTPException(400, "Το αρχείο είναι πολύ μεγάλο (max 20MB)")
     media_type = file.content_type or "image/jpeg"
     try:
-        result = ai_extract_document(ANTHROPIC_API_KEY, file_bytes, media_type, document_type)
+        result = ai_extract_document(ANTHROPIC_API_KEY, file_bytes, media_type, document_type, model=MODEL_EXTRACTION)
     except Exception as e:
         logger.error(f"AI extract error: {e}")
         raise HTTPException(500, f"Σφάλμα εξαγωγής: {str(e)[:200]}")
@@ -969,7 +972,7 @@ async def bot_chat(req: BotChatRequest, user=Depends(get_current_user)):
         client = ant.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
         try:
             async with client.messages.stream(
-                model="claude-sonnet-4-6",
+                model=MODEL_CHAT,
                 max_tokens=2048,
                 system=system_prompt,
                 messages=messages,
