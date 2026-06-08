@@ -12,7 +12,7 @@ interface PortalAuthContextType {
   user: PortalUser | null;
   token: string | null;
   loading: boolean;
-  login: (name: string, case_category: string, portal_code: string) => Promise<{ error: string | null }>;
+  login: (name: string, case_category: string, portal_code: string, source?: string, directToken?: string) => Promise<{ error: string | null }>;
   logout: () => void;
 }
 
@@ -53,9 +53,14 @@ export const PortalAuthProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     setLoading(false);
   }, [token]);
 
-  const login = async (name: string, case_category: string, portal_code: string): Promise<{ error: string | null }> => {
+  const login = async (name: string, case_category: string, portal_code: string, source?: string, directToken?: string): Promise<{ error: string | null }> => {
     try {
-      const { data } = await portalApi.login(name, case_category, portal_code);
+      if (directToken) {
+        localStorage.setItem('nomos_portal_token', directToken);
+        setToken(directToken);
+        return { error: null };
+      }
+      const { data } = await portalApi.login(name, case_category, portal_code, source);
       const jwt = data.access_token ?? data.token;
       localStorage.setItem('nomos_portal_token', jwt);
       setToken(jwt);

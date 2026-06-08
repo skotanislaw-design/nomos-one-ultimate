@@ -50,7 +50,7 @@ export default function Dashboard() {
     <div className="space-y-5 animate-fade-in-up">
 
       {/* ── Hero Banner ── */}
-      <div className="glass-card overflow-hidden relative">
+      <div className="glass-card overflow-hidden table-scroll relative">
         <div className="absolute inset-0 pointer-events-none">
           <div className="absolute -right-20 -top-20 w-72 h-72 rounded-full opacity-5"
             style={{ background: 'radial-gradient(circle, #C6A75E 0%, transparent 70%)' }} />
@@ -251,7 +251,7 @@ export default function Dashboard() {
 
       {/* ── Stagnant Cases ── */}
       {stagnant.length > 0 && (
-        <div className="glass-card overflow-hidden">
+        <div className="glass-card overflow-hidden table-scroll">
           <div className="p-4 border-b border-[#1a3a5c]/40 flex items-center gap-2">
             <Clock size={14} className="text-amber-400" />
             <h3 className="section-title">Αδρανείς Υποθέσεις</h3>

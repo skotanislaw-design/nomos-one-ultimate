@@ -249,6 +249,7 @@ export function usePWA() {
 
   return {
     ...state,
+    deviceId: localStorage.getItem('nomos_device_id'),
     checkPWACapable,
     registerDevice,
     getDevices,

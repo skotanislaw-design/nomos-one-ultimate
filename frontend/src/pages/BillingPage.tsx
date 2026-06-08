@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { TrendingUp, AlertTriangle, Clock, Mail, Send, CheckCircle, RefreshCw } from 'lucide-react';
-import { billingApi, emailApi } from '@/lib/api';
+import { billingApi, emailApi, settingsApi } from '@/lib/api';
 import { SegmentTabs } from '@/components/ui/SegmentTabs';
 import { toast } from 'sonner';
 
@@ -13,16 +13,22 @@ export default function BillingPage() {
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<BillingTab>('overview');
   const [sending, setSending] = useState<string | null>(null);
+  const [firmContact, setFirmContact] = useState('christos@skotanislaw.com');
 
   useEffect(() => {
     Promise.all([
       billingApi.reminders().catch(() => ({ data: [] })),
       billingApi.overdue().catch(() => ({ data: [] })),
       billingApi.collectionRate().catch(() => ({ data: { rate: 0 } })),
-    ]).then(([r, o, c]) => {
+      settingsApi.get().catch(() => ({ data: {} })),
+    ]).then(([r, o, c, s]) => {
       setReminders(Array.isArray(r.data) ? r.data : []);
       setOverdue(Array.isArray(o.data) ? o.data : []);
       setCollRate(c.data?.rate || c.data?.collection_rate || 0);
+      const sd = s.data || {};
+      const phone = sd.firm_phone || sd.phone || '';
+      const email = sd.firm_email || sd.email || 'christos@skotanislaw.com';
+      setFirmContact([email, phone].filter(Boolean).join(' | '));
       setLoading(false);
     });
   }, []);
@@ -54,7 +60,7 @@ export default function BillingPage() {
             <p style="margin:0 0 24px;">Παρακαλούμε επικοινωνήστε μαζί μας ή προχωρήστε στη ρύθμιση της οφειλής το συντομότερο δυνατό.</p>
             <hr style="border:none;border-top:1px solid #e0e0e0;margin:20px 0;"/>
             <p style="color:#666;font-size:12px;margin:0;">
-              Σκοτάνης &amp; Συνεργάτες &nbsp;|&nbsp; christos@skotanislaw.com &nbsp;|&nbsp; +30 210 000 0000
+              Σκοτάνης &amp; Συνεργάτες &nbsp;|&nbsp; ${firmContact}
             </p>
           </div>
         </div>`,
@@ -207,7 +213,7 @@ export default function BillingPage() {
 
       {/* ── Overdue tab ── */}
       {activeTab === 'overdue' && (
-        <div className="glass-card overflow-hidden">
+        <div className="glass-card overflow-hidden table-scroll">
           <div className="p-5 border-b border-[#1a3a5c]/40 flex items-center justify-between">
             <h3 className="section-title">Ληξιπρόθεσμα Τιμολόγια ({overdue.length})</h3>
             {overdue.length > 0 && (

@@ -11,7 +11,7 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-// Auto-logout on 401
+// Auto-logout on 401; payment gate block on 402
 api.interceptors.response.use(
   (res) => res,
   (err) => {
@@ -19,6 +19,10 @@ api.interceptors.response.use(
       localStorage.removeItem('nomos_token');
       localStorage.removeItem('nomos_user');
       window.location.href = '/login';
+    }
+    if (err.response?.status === 402) {
+      const detail = err.response.data?.detail || err.response.data || {};
+      window.dispatchEvent(new CustomEvent('payment-gate-block', { detail: typeof detail === 'string' ? { message: detail } : detail }));
     }
     return Promise.reject(err);
   }
@@ -33,6 +37,11 @@ export const authApi = {
 };
 
 // ═══════════════ USERS ═══════════════
+export const profileApi = {
+  update: (data: { full_name?: string; email?: string; phone?: string }) =>
+    api.put('/api/users/me', data),
+};
+
 export const usersApi = {
   list: () => api.get('/api/users'),
   create: (data: any) => api.post('/api/users', data),
@@ -50,6 +59,7 @@ export const usersApi = {
 export const clientsApi = {
   list: () => api.get('/api/clients'),
   get: (id: string) => api.get(`/api/clients/${id}`),
+  getCases: (id: string) => api.get(`/api/clients/${id}/cases`),
   create: (data: any) => api.post('/api/clients', data),
   update: (id: string, data: any) => api.put(`/api/clients/${id}`, data),
   export: (id: string) => api.get(`/api/clients/${id}/export`),
@@ -113,6 +123,16 @@ export const deadlinesApi = {
   delete: (id: string) => api.delete(`/api/deadlines/${id}`),
 };
 
+// ═══════════════ CALENDAR ENGINE ═══════════════
+export const calendarApi = {
+  holidays:      (year: number) => api.get('/api/calendar/holidays', { params: { year } }),
+  vacations:     (year: number) => api.get('/api/calendar/vacations', { params: { year } }),
+  deadlineTypes: () => api.get('/api/calendar/deadline-types'),
+  calculate:     (data: { start_date: string; law_code: string; deadline_type_id: string; notes?: string }) =>
+                   api.post('/api/calendar/calculate', data),
+  week:          (date?: string) => api.get('/api/calendar/week', { params: date ? { date } : {} }),
+};
+
 // ═══════════════ INVOICING ═══════════════
 export const invoicingApi = {
   calculate: (data: any) => api.post('/api/invoicing/calculate', data),
@@ -125,7 +145,8 @@ export const invoicingApi = {
 export const templatesApi = {
   list: () => api.get('/api/templates'),
   get: (id: string) => api.get(`/api/templates/${id}`),
-  fill: (id: string, data: any) => api.post(`/api/templates/${id}/fill`, data),
+  fill: (id: string, params: { case_id?: string; client_id?: string }) =>
+    api.post(`/api/templates/${id}/fill`, null, { params }),
   generate: (id: string, data: any) => api.post(`/api/templates/${id}/generate`, data, { responseType: 'blob' }),
 };
 
@@ -157,6 +178,13 @@ export const auditApi = {
 export const settingsApi = {
   get: () => api.get('/api/settings'),
   update: (data: any) => api.put('/api/settings', data),
+  sendTestEmail: (to_email: string) => api.post('/api/email/send', {
+    to_email,
+    to_name: 'Admin',
+    subject: 'NOMOS ONE — Δοκιμαστικό Email',
+    body_html: '<div style="font-family:Arial,sans-serif;padding:24px"><h2 style="color:#C6A75E">NOMOS ONE</h2><p>Το SMTP λειτουργεί σωστά! ✓</p><p style="color:#888;font-size:12px">Σκοτάνης &amp; Συνεργάτες</p></div>',
+    body_text: 'NOMOS ONE — Το SMTP λειτουργεί σωστά!',
+  }),
 };
 
 // ═══════════════ PIPELINE / LEADS ═══════════════
@@ -215,6 +243,18 @@ export const emailApi = {
   logs: () => api.get('/api/email/logs'),
 };
 
+// ═══════════════ ΠΙΝΑΚΕΙΑ ═══════════════
+export const pinakiaApi = {
+  list: () => api.get('/api/pinakia'),
+  get: (id: string) => api.get(`/api/pinakia/${id}`),
+  byDate: (date: string) => api.get(`/api/pinakia/hearings?date=${date}`),
+  search: (q: string) => api.get(`/api/pinakia/search?q=${encodeURIComponent(q)}`),
+  upload: (formData: FormData) => api.post('/api/pinakia/upload', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  }),
+  delete: (id: string) => api.delete(`/api/pinakia/${id}`),
+};
+
 // ═══════════════ LINDY AI ═══════════════
 export const lindyApi = {
   forward: (data: { message?: string; source?: string; metadata?: any }) =>
@@ -259,8 +299,8 @@ portalApi_instance.interceptors.response.use(
 
 export const portalApi = {
   // Portal authentication
-  login: (name: string, case_category: string, portal_code: string) =>
-    portalApi_instance.post('/api/portal/auth', { name, case_category, portal_code }),
+  login: (name: string, case_category: string, portal_code: string, source?: string) =>
+    portalApi_instance.post('/api/portal/auth', { name, case_category, portal_code, ...(source ? { source } : {}) }),
 
   // Portal case access
   getCase: () => portalApi_instance.get('/api/portal/my-case'),
@@ -269,8 +309,15 @@ export const portalApi = {
   // Portal messaging
   sendMessage: (content: string, subject?: string) =>
     portalApi_instance.post('/api/portal/messages', { content, subject }),
+  getMessages: () => portalApi_instance.get('/api/portal/messages'),
 
-  // Portal document upload
+  // Portal progress (hearings + deadlines)
+  getProgress: () => portalApi_instance.get('/api/portal/progress'),
+
+  // Portal financials (detailed)
+  getFinancials: () => portalApi_instance.get('/api/portal/financials'),
+
+  // Portal document upload (staged → confirm)
   uploadDocument: (file: File) => {
     const fd = new FormData();
     fd.append('file', file);
@@ -278,10 +325,14 @@ export const portalApi = {
       headers: { 'Content-Type': 'multipart/form-data' }
     });
   },
+  confirmUpload: () => portalApi_instance.post('/api/portal/upload-confirm'),
 
   // Portal forgot password
   forgotPassword: (name: string, case_category: string) =>
     portalApi_instance.post('/api/portal/forgot-password', { name, case_category }),
+
+  // Accept mandate on first login
+  acceptMandate: () => portalApi_instance.post('/api/portal/accept-mandate'),
 };
 
 // ═══════════════ ADMIN PORTAL MANAGEMENT ═══════════════
@@ -291,31 +342,40 @@ export const notificationsApi = {
 
 
 export const adminPortalApi = {
-  // Generate portal access for a case
-  generatePortalAccess: (client_id: string, case_id: string, permissions?: string[]) =>
-    api.post(`/api/admin/clients/${client_id}/generate-portal-access`, { permissions }),
+  generatePortalAccess: (client_id: string, case_id: string, permissions: string[]) =>
+    api.post(`/api/admin/clients/${client_id}/generate-portal-access`, { case_id, permissions }),
 
-  // Update portal permissions
   updatePortalPermissions: (case_id: string, permissions: string[]) =>
     api.patch(`/api/admin/cases/${case_id}/portal-permissions`, { permissions }),
 
-  // List portal access codes (admin view)
-  listPortalAccess: () => api.get('/api/admin/portal-access'),
+  listPortalAccess:    () => api.get('/api/admin/portal-access'),
+  listResetRequests:   () => api.get('/api/admin/portal-reset-requests'),
+  listPortalDocuments: () => api.get('/api/admin/portal-documents'),
 
-  // List password reset requests
-  listResetRequests: () => api.get('/api/admin/portal-reset-requests'),
-
-  // Approve password reset request
   approveResetRequest: (request_id: string) =>
     api.post(`/api/admin/portal-reset-requests/${request_id}/approve`),
-
-  // Reject password reset request
   rejectResetRequest: (request_id: string) =>
     api.post(`/api/admin/portal-reset-requests/${request_id}/reject`),
 
-  // Delete a portal access code
+  approvePortalDocument: (doc_id: string) =>
+    api.post(`/api/admin/portal-documents/${doc_id}/approve`),
+  rejectPortalDocument: (doc_id: string) =>
+    api.post(`/api/admin/portal-documents/${doc_id}/reject`),
+
   deletePortalAccess: (code_id: string) =>
     api.delete(`/api/admin/portal-access/${code_id}`),
+
+  // Admin portal message inbox
+  listPortalMessages:    () => api.get('/api/admin/portal-messages'),
+  markMessageRead:       (msg_id: string) => api.patch(`/api/admin/portal-messages/${msg_id}/read`),
+  replyToPortalMessage:  (msg_id: string, content: string) =>
+    api.post(`/api/admin/portal-messages/${msg_id}/reply`, { content }),
+};
+
+// ═══════════════ LINDA AI ═══════════════
+export const lindaApi = {
+  chat: (message: string, history: { role: string; content: string }[]) =>
+    api.post('/api/linda/chat', { message, history }, { responseType: 'stream' }),
 };
 
 
@@ -346,4 +406,48 @@ export const aiApi = {
     return api.post('/api/ai/extract-document', fd);
   }
 };
+// ═══════════════ CRIMINAL CASES ═══════════════
+export const criminalApi = {
+  // Cases
+  list: () => api.get('/api/criminal/cases'),
+  create: (data: any) => api.post('/api/criminal/cases', data),
+  get: (id: string) => api.get(`/api/criminal/cases/${id}`),
+  update: (id: string, data: any) => api.patch(`/api/criminal/cases/${id}`, data),
+  delete: (id: string) => api.delete(`/api/criminal/cases/${id}`),
+  health: (id: string) => api.get(`/api/criminal/cases/${id}/health`),
+  // Parties
+  listParties: (id: string) => api.get(`/api/criminal/cases/${id}/parties`),
+  createParty: (id: string, data: any) => api.post(`/api/criminal/cases/${id}/parties`, data),
+  deleteParty: (id: string, partyId: string) => api.delete(`/api/criminal/cases/${id}/parties/${partyId}`),
+  // Events
+  listEvents: (id: string) => api.get(`/api/criminal/cases/${id}/events`),
+  createEvent: (id: string, data: any) => api.post(`/api/criminal/cases/${id}/events`, data),
+  deleteEvent: (id: string, eventId: string) => api.delete(`/api/criminal/cases/${id}/events/${eventId}`),
+  // Documents
+  listDocuments: (id: string) => api.get(`/api/criminal/cases/${id}/documents`),
+  uploadDocument: (id: string, formData: FormData) => api.post(`/api/criminal/cases/${id}/documents`, formData, { headers: { 'Content-Type': 'multipart/form-data' }}),
+  deleteDocument: (id: string, docId: string) => api.delete(`/api/criminal/cases/${id}/documents/${docId}`),
+  // Evidence
+  listEvidence: (id: string) => api.get(`/api/criminal/cases/${id}/evidence`),
+  createEvidence: (id: string, data: any) => api.post(`/api/criminal/cases/${id}/evidence`, data),
+  deleteEvidence: (id: string, evId: string) => api.delete(`/api/criminal/cases/${id}/evidence/${evId}`),
+  // Issues
+  listIssues: (id: string) => api.get(`/api/criminal/cases/${id}/issues`),
+  createIssue: (id: string, data: any) => api.post(`/api/criminal/cases/${id}/issues`, data),
+  deleteIssue: (id: string, issueId: string) => api.delete(`/api/criminal/cases/${id}/issues/${issueId}`),
+  // Tasks
+  listTasks: (id: string) => api.get(`/api/criminal/cases/${id}/tasks`),
+  createTask: (id: string, data: any) => api.post(`/api/criminal/cases/${id}/tasks`, data),
+  updateTask: (id: string, taskId: string, data: any) => api.patch(`/api/criminal/cases/${id}/tasks/${taskId}`, data),
+  deleteTask: (id: string, taskId: string) => api.delete(`/api/criminal/cases/${id}/tasks/${taskId}`),
+  // Outputs
+  listOutputs: (id: string) => api.get(`/api/criminal/cases/${id}/outputs`),
+  generateOutput: (id: string, data: any) => api.post(`/api/criminal/cases/${id}/outputs/generate`, data),
+  updateOutput: (id: string, outId: string, data: any) => api.patch(`/api/criminal/cases/${id}/outputs/${outId}`, data),
+  deleteOutput: (id: string, outId: string) => api.delete(`/api/criminal/cases/${id}/outputs/${outId}`),
+  exportOutput: (id: string, outId: string, format: string) => api.get(`/api/criminal/cases/${id}/outputs/${outId}/export?format=${format}`, { responseType: 'blob' }),
+  // Audit
+  caseAudit: (id: string) => api.get(`/api/criminal/cases/${id}/audit`),
+};
+
 export default api;

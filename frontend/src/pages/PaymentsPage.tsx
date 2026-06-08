@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Plus, X, Download, CreditCard, TrendingUp, Clock, CheckCircle, Trash2, AlertTriangle, FileSpreadsheet } from 'lucide-react';
-import { paymentsApi, casesApi, exportApi } from '@/lib/api';
+import { paymentsApi, casesApi, exportApi, authApi } from '@/lib/api';
+import { parseTs } from '@/lib/prefs';
 import { usePermissions } from '@/hooks/usePermissions';
 import { SegmentTabs } from '@/components/ui/SegmentTabs';
 import { toast } from 'sonner';
@@ -57,8 +58,8 @@ export default function PaymentsPage() {
 
   const totalReceived = payments.reduce((s, p) => s + Number(p.amount || 0), 0);
   const thisMonthPayments = payments.filter(p => {
-    const d = p.payment_date ? new Date(p.payment_date) : null;
-    if (!d) return false;
+    const d = p.payment_date ? parseTs(p.payment_date) : null;
+    if (!d || isNaN(d.getTime())) return false;
     const now = new Date();
     return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
   });
@@ -90,7 +91,12 @@ export default function PaymentsPage() {
 
   const handleDelete = async () => {
     if (!deleteTarget) return;
-    if (adminPassword !== 'Admin123@' && !perms.isAdmin) { toast.error('Λάθος κωδικός'); return; }
+    try {
+      await authApi.verifyPassword(adminPassword);
+    } catch {
+      toast.error('Λάθος κωδικός διαχειριστή');
+      return;
+    }
     try {
       await paymentsApi.delete(deleteTarget._id || deleteTarget.id);
       toast.success('Πληρωμή διαγράφηκε');
@@ -155,7 +161,7 @@ export default function PaymentsPage() {
       </div>
 
       {/* Table */}
-      <div className="glass-card overflow-hidden">
+      <div className="glass-card overflow-hidden table-scroll">
         <table className="w-full table-premium">
           <thead>
             <tr className="bg-[#0d2035]/40">
@@ -173,7 +179,7 @@ export default function PaymentsPage() {
               return (
                 <tr key={p._id || p.id}>
                   <td className="text-xs">
-                    {p.payment_date ? new Date(p.payment_date).toLocaleDateString('el-GR') : '—'}
+                    {p.payment_date ? (parseTs(p.payment_date)?.toLocaleDateString('el-GR') ?? '—') : '—'}
                   </td>
                   <td>
                     <p className="text-xs font-medium text-[#d4dce8]">{p.case_title || p.case_id || '—'}</p>

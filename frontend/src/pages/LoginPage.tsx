@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Scale, Mail, Lock, Eye, EyeOff, LogIn } from 'lucide-react';
+import { Mail, Lock, Eye, EyeOff, LogIn } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
 
 export default function LoginPage() {
@@ -40,18 +40,14 @@ export default function LoginPage() {
       <div className="w-full max-w-sm relative z-10 animate-fade-in-up">
         {/* Logo */}
         <div className="text-center mb-10">
-          <div className="relative inline-flex items-center justify-center mb-5">
-            <div className="w-20 h-20 rounded-2xl flex items-center justify-center"
-              style={{ background: 'linear-gradient(135deg, #C6A75E 0%, #A8893D 100%)', boxShadow: '0 0 40px rgba(198,167,94,0.25), 0 8px 32px rgba(0,0,0,0.4)' }}>
-              <Scale size={32} className="text-[#071220]" />
-            </div>
-            <div className="absolute w-24 h-24 rounded-2xl border border-[#C6A75E]/15" />
-          </div>
-          <div className="flex items-center gap-3 justify-center mb-2">
-            <div className="h-px w-10" style={{ background: 'linear-gradient(90deg, transparent, rgba(198,167,94,0.6))' }} />
-            <h1 className="text-2xl font-semibold tracking-[0.12em] text-[#C6A75E]"
-              style={{ fontFamily: 'EB Garamond, Georgia, serif' }}>NOMOS ONE</h1>
-            <div className="h-px w-10" style={{ background: 'linear-gradient(90deg, rgba(198,167,94,0.6), transparent)' }} />
+          <div className="relative inline-flex items-center justify-center mb-4">
+            <img
+              src="/logo.png"
+              alt="Nomos One"
+              className="w-40 h-40 rounded-full object-cover"
+              style={{ boxShadow: '0 0 60px rgba(198,167,94,0.22), 0 8px 40px rgba(0,0,0,0.55)' }}
+            />
+            <div className="absolute w-44 h-44 rounded-full border border-[#C6A75E]/12 animate-pulse" style={{ animationDuration: '3s' }} />
           </div>
           <p className="text-[11px] text-[#4a6a8a] tracking-[0.1em] uppercase">Σκοτάνης & Συνεργάτες · Legal Operations</p>
         </div>

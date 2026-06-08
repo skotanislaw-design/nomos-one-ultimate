@@ -2,26 +2,44 @@ import { useState } from 'react';
 import { Save, Moon, Globe, Bell, Eye, Monitor, Palette, Type } from 'lucide-react';
 import { SegmentTabs } from '@/components/ui/SegmentTabs';
 import { toast } from 'sonner';
+import { applyPreferences } from '@/lib/applyPreferences';
 
 type PrefTab = 'display' | 'notifications' | 'language';
 
+type Prefs = {
+  language: string; dateFormat: string; currency: string; timezone: string;
+  theme: string; sidebarCollapsed: boolean; compactMode: boolean; fontSize: string;
+  notifyDeadlines: boolean; notifyInvoices: boolean; notifyMessages: boolean;
+  notifyStagnant: boolean; emailDigest: string;
+};
+
+const DEFAULTS: Prefs = {
+  language: 'el',
+  dateFormat: 'DD/MM/YYYY',
+  currency: 'EUR',
+  timezone: 'Europe/Athens',
+  theme: 'dark',
+  sidebarCollapsed: false,
+  compactMode: false,
+  fontSize: 'medium',
+  notifyDeadlines: true,
+  notifyInvoices: true,
+  notifyMessages: true,
+  notifyStagnant: false,
+  emailDigest: 'daily',
+};
+
+function loadPrefs(): Prefs {
+  try {
+    const stored = localStorage.getItem('nomos_preferences');
+    if (stored) return { ...DEFAULTS, ...JSON.parse(stored) };
+  } catch { /* ignore */ }
+  return DEFAULTS;
+}
+
 export default function PreferencesPage() {
   const [activeTab, setActiveTab] = useState<PrefTab>('display');
-  const [prefs, setPrefs] = useState({
-    language: 'el',
-    dateFormat: 'DD/MM/YYYY',
-    currency: 'EUR',
-    timezone: 'Europe/Athens',
-    theme: 'dark',
-    sidebarCollapsed: false,
-    compactMode: false,
-    fontSize: 'medium',
-    notifyDeadlines: true,
-    notifyInvoices: true,
-    notifyMessages: true,
-    notifyStagnant: false,
-    emailDigest: 'daily',
-  });
+  const [prefs, setPrefs] = useState(loadPrefs);
 
   const tabs = [
     { id: 'display' as PrefTab, label: 'Εμφάνιση' },
@@ -31,10 +49,20 @@ export default function PreferencesPage() {
 
   const handleSave = () => {
     localStorage.setItem('nomos_preferences', JSON.stringify(prefs));
+    applyPreferences(prefs);
+    window.dispatchEvent(new Event('nomos-prefs-changed'));
     toast.success('Προτιμήσεις αποθηκεύτηκαν');
   };
 
-  const toggle = (key: keyof typeof prefs) => setPrefs(p => ({ ...p, [key]: !p[key] }));
+  const setPref = <K extends keyof Prefs>(key: K, value: Prefs[K]) => {
+    setPrefs((p: Prefs) => {
+      const next = { ...p, [key]: value };
+      applyPreferences(next);
+      return next;
+    });
+  };
+
+  const toggle = (key: keyof Prefs) => setPref(key, !prefs[key] as any);
 
   return (
     <div className="space-y-6">
@@ -57,7 +85,7 @@ export default function PreferencesPage() {
                 { id: 'darker', label: 'Βαθύ Σκοτεινό', icon: Monitor, desc: 'Βαθύτερο' },
                 { id: 'auto', label: 'Αυτόματο', icon: Eye, desc: 'Ανάλογα ώρας' },
               ].map(t => (
-                <button key={t.id} onClick={() => setPrefs(p => ({ ...p, theme: t.id }))}
+                <button key={t.id} onClick={() => setPref('theme', t.id)}
                   className={`p-4 rounded-xl border text-center transition-all ${prefs.theme === t.id ? 'border-[#C6A75E] bg-[#C6A75E]/10' : 'border-[#1a3a5c]/40 bg-[#0d2035]/20 hover:border-[#1a3a5c]'}`}>
                   <t.icon size={20} className={`mx-auto mb-2 ${prefs.theme === t.id ? 'text-[#C6A75E]' : 'text-[#5a7a9a]'}`} />
                   <p className={`text-xs font-medium ${prefs.theme === t.id ? 'text-[#C6A75E]' : 'text-[#8aa0b8]'}`}>{t.label}</p>
@@ -72,7 +100,7 @@ export default function PreferencesPage() {
             <label className="label mb-3 flex items-center gap-2"><Type size={14} /> Μέγεθος Κειμένου</label>
             <div className="flex gap-2">
               {[{ id: 'small', label: 'Μικρό' }, { id: 'medium', label: 'Κανονικό' }, { id: 'large', label: 'Μεγάλο' }].map(s => (
-                <button key={s.id} onClick={() => setPrefs(p => ({ ...p, fontSize: s.id }))}
+                <button key={s.id} onClick={() => setPref('fontSize', s.id)}
                   className={`flex-1 py-2 rounded-lg text-xs font-medium transition-all ${prefs.fontSize === s.id ? 'bg-[#C6A75E] text-[#071220]' : 'bg-[#0d2035]/60 border border-[#1a3a5c]/40 text-[#8aa0b8] hover:border-[#C6A75E]/30'}`}>
                   {s.label}
                 </button>
@@ -119,7 +147,7 @@ export default function PreferencesPage() {
 
           <div>
             <label className="label">Email Digest</label>
-            <select value={prefs.emailDigest} onChange={e => setPrefs(p => ({ ...p, emailDigest: e.target.value }))} className="input-dark max-w-xs">
+            <select value={prefs.emailDigest} onChange={e => setPref('emailDigest', e.target.value)} className="input-dark max-w-xs">
               <option value="realtime">Άμεσα</option>
               <option value="daily">Ημερήσια Σύνοψη</option>
               <option value="weekly">Εβδομαδιαία Σύνοψη</option>
@@ -139,14 +167,14 @@ export default function PreferencesPage() {
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="label">Γλώσσα Διεπαφής</label>
-              <select value={prefs.language} onChange={e => setPrefs(p => ({ ...p, language: e.target.value }))} className="input-dark">
+              <select value={prefs.language} onChange={e => setPref('language', e.target.value)} className="input-dark">
                 <option value="el">Ελληνικά</option>
                 <option value="en">English</option>
               </select>
             </div>
             <div>
               <label className="label">Ζώνη Ώρας</label>
-              <select value={prefs.timezone} onChange={e => setPrefs(p => ({ ...p, timezone: e.target.value }))} className="input-dark">
+              <select value={prefs.timezone} onChange={e => setPref('timezone', e.target.value)} className="input-dark">
                 <option value="Europe/Athens">Αθήνα (GMT+2/+3)</option>
                 <option value="Europe/London">Λονδίνο (GMT+0/+1)</option>
                 <option value="Europe/Paris">Παρίσι (GMT+1/+2)</option>
@@ -154,7 +182,7 @@ export default function PreferencesPage() {
             </div>
             <div>
               <label className="label">Μορφή Ημερομηνίας</label>
-              <select value={prefs.dateFormat} onChange={e => setPrefs(p => ({ ...p, dateFormat: e.target.value }))} className="input-dark">
+              <select value={prefs.dateFormat} onChange={e => setPref('dateFormat', e.target.value)} className="input-dark">
                 <option value="DD/MM/YYYY">ΗΗ/ΜΜ/ΕΕΕΕ (π.χ. 13/04/2026)</option>
                 <option value="MM/DD/YYYY">ΜΜ/ΗΗ/ΕΕΕΕ (π.χ. 04/13/2026)</option>
                 <option value="YYYY-MM-DD">ΕΕΕΕ-ΜΜ-ΗΗ (π.χ. 2026-04-13)</option>
@@ -162,7 +190,7 @@ export default function PreferencesPage() {
             </div>
             <div>
               <label className="label">Νόμισμα</label>
-              <select value={prefs.currency} onChange={e => setPrefs(p => ({ ...p, currency: e.target.value }))} className="input-dark">
+              <select value={prefs.currency} onChange={e => setPref('currency', e.target.value)} className="input-dark">
                 <option value="EUR">EUR (€) — Ευρώ</option>
                 <option value="USD">USD ($) — Δολάριο</option>
                 <option value="GBP">GBP (£) — Λίρα</option>

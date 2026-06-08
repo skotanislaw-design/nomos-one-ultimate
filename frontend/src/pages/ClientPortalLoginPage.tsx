@@ -1,17 +1,39 @@
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { Scale, User, Code, X, Mail, AlertCircle } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Scale, User, Code, X, Mail, AlertCircle, CheckCircle2 } from 'lucide-react';
 import { usePortalAuth } from '@/contexts/PortalAuthContext';
+import { portalApi } from '@/lib/api';
 import { toast } from 'sonner';
 
 export default function ClientPortalLoginPage() {
   const { login, user } = usePortalAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [name, setName] = useState('');
-  const [caseCategory, setCaseCategory] = useState('');
   const [portalCode, setPortalCode] = useState('');
+  const [codeFromUrl, setCodeFromUrl] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    // Handle token passed from external sites (e.g. skotanislaw.gr embedded form)
+    const externalToken = searchParams.get('token');
+    if (externalToken) {
+      login('', '', '', undefined, externalToken!).then(result => {
+        if (!result.error) navigate('/portal/dashboard');
+      });
+      window.history.replaceState({}, '', '/portal/login');
+      return;
+    }
+
+    const urlCode = searchParams.get('code') || searchParams.get('portal_code');
+    if (urlCode) {
+      setPortalCode(urlCode.trim());
+      setCodeFromUrl(true);
+      // Remove ?code= from URL to avoid leakage in browser history / screenshots
+      window.history.replaceState({}, '', '/portal/login');
+    }
+  }, [searchParams]);
   const [showForgotPassword, setShowForgotPassword] = useState(false);
   const [forgotName, setForgotName] = useState('');
   const [forgotCategory, setForgotCategory] = useState('');
@@ -19,11 +41,15 @@ export default function ClientPortalLoginPage() {
 
   if (user) { navigate('/portal/dashboard'); return null; }
 
+  const canSubmit = portalCode.length > 0 && name.trim().length >= 3;
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canSubmit) return;
     setLoading(true);
     setError('');
-    const result = await login(name, caseCategory, portalCode);
+    const source = codeFromUrl ? 'email_link' : undefined;
+    const result = await login(name, '', portalCode, source);
     if (result.error) {
       setError(result.error);
       toast.error(result.error);
@@ -103,39 +129,29 @@ export default function ClientPortalLoginPage() {
               </div>
 
               <div>
-                <label className="label">Κατηγορία Υπόθεσης</label>
-                <select
-                  value={caseCategory}
-                  onChange={e => setCaseCategory(e.target.value)}
-                  className="input-dark"
-                  required
-                >
-                  <option value="">— Επιλέξτε —</option>
-                  {caseCategories.map(cat => (
-                    <option key={cat} value={cat}>{cat}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
                 <label className="label">Κωδικός Πύλης</label>
                 <div className="relative">
                   <Code size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#5a7a9a]" />
                   <input
                     type="text"
                     value={portalCode}
-                    onChange={e => setPortalCode(e.target.value.toUpperCase())}
-                    className="input-dark pl-9 font-mono tracking-widest"
+                    onChange={e => { setPortalCode(e.target.value.trim()); setCodeFromUrl(false); }}
+                    className={`input-dark pl-9 font-mono tracking-widest ${codeFromUrl ? 'border-emerald-500/40 focus:border-emerald-500' : ''}`}
                     placeholder="ABC123XYZ"
                     required
                   />
+                  {codeFromUrl && (
+                    <CheckCircle2 size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-emerald-400" />
+                  )}
                 </div>
-                <p className="text-[10px] text-[#5a7a9a] mt-1">Λάβατε αυτόν τον κωδικό μέσω email</p>
+                <p className="text-[10px] mt-1 transition-colors" style={{ color: codeFromUrl ? '#34d399' : '#5a7a9a' }}>
+                  {codeFromUrl ? 'Ο κωδικός συμπληρώθηκε αυτόματα από τον σύνδεσμο' : 'Λάβατε αυτόν τον κωδικό μέσω email'}
+                </p>
               </div>
 
               <button
                 type="submit"
-                disabled={loading}
+                disabled={loading || !canSubmit}
                 className="btn-gold w-full py-3 font-medium"
               >
                 {loading ? 'Σύνδεση...' : 'Είσοδος'}

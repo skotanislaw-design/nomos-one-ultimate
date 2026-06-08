@@ -251,7 +251,7 @@ export default function CRMWorkflowPage() {
 
           {/* Stuck cases table */}
           {stuck.length > 0 && (
-            <div className="glass-card overflow-hidden">
+            <div className="glass-card overflow-hidden table-scroll">
               <div className="p-5 border-b border-[#1a3a5c]/40">
                 <h3 className="section-title">⚠ Stuck Υποθέσεις</h3>
               </div>
@@ -289,7 +289,7 @@ export default function CRMWorkflowPage() {
 
           {/* No action cases */}
           {noAction.length > 0 && (
-            <div className="glass-card overflow-hidden">
+            <div className="glass-card overflow-hidden table-scroll">
               <div className="p-5 border-b border-[#1a3a5c]/40">
                 <h3 className="section-title">⏳ Χωρίς Επόμενο Βήμα</h3>
               </div>

@@ -3,6 +3,7 @@ import { Upload, FileText, FolderOpen, Search, Download, Trash2, Eye, Cloud, Har
 import { SegmentTabs } from '@/components/ui/SegmentTabs';
 import { casesApi, documentsApi } from '@/lib/api';
 import { toast } from 'sonner';
+import { parseTs } from '@/lib/prefs';
 
 type VaultTab = 'local' | 'drive' | 'recent';
 
@@ -135,7 +136,7 @@ export default function DocumentVaultPage() {
           </div>
 
           {/* Files list */}
-          <div className="glass-card overflow-hidden">
+          <div className="glass-card overflow-hidden table-scroll">
             {filtered.length === 0 ? (
               <div className="py-16 text-center">
                 <FolderOpen size={40} className="mx-auto text-[#2a4a6a] mb-3" />
@@ -155,7 +156,7 @@ export default function DocumentVaultPage() {
                       </td>
                       <td className="hidden sm:table-cell text-xs text-[#5a7a9a]">{doc.type || '—'}</td>
                       <td className="hidden md:table-cell font-mono text-xs">{formatSize(doc.size)}</td>
-                      <td className="hidden lg:table-cell text-xs">{doc.created_at ? new Date(doc.created_at).toLocaleDateString('el-GR') : '—'}</td>
+                      <td className="hidden lg:table-cell text-xs">{doc.created_at ? (parseTs(doc.created_at)?.toLocaleDateString('el-GR') ?? '—') : '—'}</td>
                       <td>
                         <div className="flex items-center gap-1">
                           <button title="Λήψη" className="p-1.5 rounded hover:bg-[#132B45] text-[#7a9ab8] hover:text-[#C6A75E] transition-all">
@@ -189,19 +190,18 @@ export default function DocumentVaultPage() {
                 <p className="text-sm text-[#7a9ab8] max-w-sm mx-auto">Συγχρονίστε αυτόματα τα έγγραφα σας με το Google Drive για ασφαλή αποθήκευση και πρόσβαση από παντού.</p>
               </div>
 
-              {/* OAuth placeholder */}
-              <div className="p-4 rounded-xl bg-amber-500/5 border border-amber-500/20 text-left max-w-sm mx-auto">
+              <div className="p-4 rounded-xl bg-blue-500/5 border border-blue-500/20 text-left max-w-sm mx-auto">
                 <div className="flex items-center gap-2 mb-2">
-                  <AlertCircle size={14} className="text-amber-400" />
-                  <p className="text-xs font-semibold text-amber-300">OAuth Placeholder</p>
+                  <AlertCircle size={14} className="text-blue-400" />
+                  <p className="text-xs font-semibold text-blue-300">Ρύθμιση απαιτείται</p>
                 </div>
-                <p className="text-xs text-[#7a9ab8]">Για να ενεργοποιήσετε το Google Drive, χρειάζεστε Google OAuth credentials. Διαμορφώστε τα στις Ρυθμίσεις → Integrations.</p>
+                <p className="text-xs text-[#7a9ab8]">Για να ενεργοποιήσετε το Google Drive, ρυθμίστε το OAuth client JSON στις <strong className="text-[#c0d0e0]">Ρυθμίσεις → Integrations → Google Drive</strong>.</p>
               </div>
 
               <button
-                onClick={() => toast.info('Ανακατεύθυνση στο Google OAuth... (Placeholder)')}
+                onClick={() => { window.history.pushState({}, '', '/settings'); window.dispatchEvent(new PopStateEvent('popstate')); }}
                 className="btn-gold flex items-center gap-2 mx-auto">
-                <Link2 size={14} /> Σύνδεση με Google Drive
+                <Link2 size={14} /> Μετάβαση στις Ρυθμίσεις
               </button>
 
               {/* Features */}
@@ -237,7 +237,7 @@ export default function DocumentVaultPage() {
                   <span className="text-xl">{fileIcon(doc.filename)}</span>
                   <div className="flex-1 min-w-0">
                     <p className="text-sm text-[#d4dce8] font-medium truncate">{doc.filename}</p>
-                    <p className="text-xs text-[#5a7a9a]">Προστέθηκε • {doc.created_at ? new Date(doc.created_at).toLocaleString('el-GR') : '—'}</p>
+                    <p className="text-xs text-[#5a7a9a]">Προστέθηκε • {doc.created_at ? (parseTs(doc.created_at)?.toLocaleString('el-GR') ?? '—') : '—'}</p>
                   </div>
                   <span className="text-xs text-[#4a6a8a]">{formatSize(doc.size)}</span>
                 </div>

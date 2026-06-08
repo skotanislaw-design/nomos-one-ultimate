@@ -24,7 +24,7 @@ export default function WorkflowPage() {
         <div className="glass-card p-5 border-l-[3px] border-amber-500/30"><Clock size={20} className="text-amber-400 mb-2" /><p className="text-3xl font-bold text-amber-400">{noAction.length}</p><p className="text-xs text-[#6a8aaa] uppercase">Χωρίς επόμενο βήμα</p></div>
       </div>
       {stuck.length > 0 && (
-        <div className="glass-card overflow-hidden">
+        <div className="glass-card overflow-hidden table-scroll">
           <div className="p-5 border-b border-[#1a3a5c]/40"><h3 className="section-title">⚠ Stuck Υποθέσεις</h3></div>
           <table className="w-full table-premium"><thead><tr className="bg-[#0d2035]/40"><th>Κωδικός</th><th>Τίτλος</th><th className="hidden sm:table-cell">Στάδιο</th><th>Ημέρες</th><th></th></tr></thead>
           <tbody>{stuck.map((c: any) => (<tr key={c._id||c.id}><td className="font-mono text-xs text-[#C6A75E]">{c.case_number||'—'}</td><td className="text-sm text-[#d4dce8]">{c.title}</td><td className="hidden sm:table-cell text-xs">{c.status || c.stage || '—'}</td><td><span className="status-urgent">{c.days_since_update||c.days||'?'}d</span></td><td><button onClick={() => nav(`/cases/${c._id||c.id}`)} className="text-[#C6A75E] hover:text-[#E8C97A]"><ArrowRight size={14} /></button></td></tr>))}</tbody>

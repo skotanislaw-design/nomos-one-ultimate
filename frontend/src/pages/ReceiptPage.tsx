@@ -1,13 +1,8 @@
 import { useEffect, useState } from 'react';
-import { Eye, Download, Printer, Mail, Loader2, FileText } from 'lucide-react';
-import { casesApi, auditApi, invoicingApi, exportApi, emailApi } from '@/lib/api';
+import { Eye, Printer, Mail, Loader2, FileText } from 'lucide-react';
+import { casesApi, auditApi, invoicingApi, exportApi, emailApi, settingsApi } from '@/lib/api';
+import { parseTs } from '@/lib/prefs';
 import { toast } from 'sonner';
-
-const FIRM_NAME    = 'Σκοτάνης & Συνεργάτες';
-const FIRM_ADDRESS = 'Αθήνα, Ελλάδα';
-const FIRM_PHONE   = '+30 210 000 0000';
-const FIRM_EMAIL   = 'christos@skotanislaw.com';
-const FIRM_AFM     = '123456789';
 
 const fmt = (n: number) => `€${Number(n || 0).toLocaleString('el-GR', { minimumFractionDigits: 2 })}`;
 
@@ -33,6 +28,7 @@ interface ReceiptData {
 export default function ReceiptPage() {
   const [cases, setCases] = useState<any[]>([]);
   const [selectedCaseId, setSelectedCaseId] = useState('');
+  const [firm, setFirm] = useState({ name: '', address: '', phone: '', email: '', afm: '' });
   const [receiptData, setReceiptData] = useState<ReceiptData>({
     case: null,
     actions: [],
@@ -45,14 +41,26 @@ export default function ReceiptPage() {
   const [emailSending, setEmailSending] = useState(false);
   const [pdfDownloading, setPdfDownloading] = useState(false);
 
-  /* ── Load cases ── */
+  /* ── Load cases + firm settings ── */
   const loadCases = () => {
     casesApi.list()
       .then(r => setCases(Array.isArray(r.data) ? r.data : []))
       .catch(() => setCases([]));
   };
 
-  useEffect(loadCases, []);
+  useEffect(() => {
+    loadCases();
+    settingsApi.get().then(r => {
+      const s = r.data || {};
+      setFirm({
+        name: s.firm_name || s.name || 'Σκοτάνης & Συνεργάτες',
+        address: s.firm_address || s.address || 'Αθήνα, Ελλάδα',
+        phone: s.firm_phone || s.phone || '',
+        email: s.firm_email || s.email || 'christos@skotanislaw.com',
+        afm: s.firm_afm || s.afm || '',
+      });
+    }).catch(() => {});
+  }, []);
 
   /* ── Load receipt data for selected case ── */
   useEffect(() => {
@@ -126,7 +134,7 @@ export default function ReceiptPage() {
     }
   };
 
-  /* ── Download receipt as PDF ── */
+  /* ── Print receipt ── */
   const downloadReceiptPDF = async () => {
     if (!receiptData.case) {
       toast.error('Επιλέξτε υπόθεση');
@@ -135,11 +143,17 @@ export default function ReceiptPage() {
 
     setPdfDownloading(true);
     try {
-      // For now, use window.print() - in production, would use exportApi.receiptPdf()
-      window.print();
-      toast.success('Έτοιμο για εκτύπωση');
+      const printArea = document.getElementById('receipt-print');
+      if (printArea) {
+        const win = window.open('', '', 'height=800,width=800');
+        if (win) {
+          win.document.write(`<html><head><title>Απόδειξη</title></head><body>${printArea.innerHTML}</body></html>`);
+          win.document.close();
+          win.print();
+        }
+      }
     } catch (err: any) {
-      toast.error('Σφάλμα εξαγωγής');
+      toast.error('Σφάλμα εκτύπωσης');
     } finally {
       setPdfDownloading(false);
     }
@@ -150,7 +164,7 @@ export default function ReceiptPage() {
     return `
       <div style="font-family:Arial,sans-serif;max-width:800px;color:#1a1a2e;">
         <div style="background:#071220;padding:30px;border-radius:8px 8px 0 0;text-align:center;">
-          <h1 style="color:#C6A75E;margin:0;">Σκοτάνης & Συνεργάτες</h1>
+          <h1 style="color:#C6A75E;margin:0;">${firm.name}</h1>
           <p style="color:#6a8aaa;margin:8px 0;font-size:14px;">Νομικό Γραφείο</p>
           <h2 style="color:#C6A75E;margin:20px 0 0;font-size:24px;">ΑΠΟΔΕΙΞΗ ΠΑΡΟΧΗΣ ΥΠΗΡΕΣΙΩΝ</h2>
         </div>
@@ -187,7 +201,7 @@ export default function ReceiptPage() {
               ${receiptData.actions.slice(0, 20).map((action: ActionType) => `
                 <tr style="border-bottom:1px solid #e0e0e0;">
                   <td style="padding:10px;font-size:12px;color:#666;">${
-                    new Date(action.created_at).toLocaleDateString('el-GR')
+                    parseTs(action.created_at)?.toLocaleDateString('el-GR') ?? '—'
                   }</td>
                   <td style="padding:10px;font-size:12px;color:#071220;">${formatActionLabel(action.action)}</td>
                   <td style="padding:10px;font-size:12px;color:#666;">${action.user_name || '—'}</td>
@@ -216,7 +230,7 @@ export default function ReceiptPage() {
             Αυτή η απόδειξη επιβεβαιώνει ότι οι ανωτέρω υπηρεσίες παρασχέθησαν στον/στην ανωτέρω πελάτη σύμφωνα με τους όρους της σύμβασης.
           </p>
           <p style="color:#999;font-size:11px;margin-top:20px;border-top:1px solid #ddd;padding-top:20px;">
-            ${FIRM_NAME} | ${FIRM_ADDRESS} | ${FIRM_PHONE} | ${FIRM_EMAIL} | ΑΦΜ: ${FIRM_AFM}
+            ${firm.name} | ${firm.address}${firm.phone ? ' | ' + firm.phone : ''} | ${firm.email}${firm.afm ? ' | ΑΦΜ: ' + firm.afm : ''}
           </p>
         </div>
       </div>
@@ -259,10 +273,10 @@ export default function ReceiptPage() {
               <button
                 onClick={downloadReceiptPDF}
                 disabled={pdfDownloading}
-                className="btn-dark text-xs flex items-center gap-1.5 text-red-400 border-red-500/30"
+                className="btn-dark text-xs flex items-center gap-1.5"
               >
-                {pdfDownloading ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
-                PDF
+                {pdfDownloading ? <Loader2 size={13} className="animate-spin" /> : <Printer size={13} />}
+                Εκτύπωση
               </button>
               <button
                 onClick={() => setPreviewOpen(!previewOpen)}
@@ -366,7 +380,7 @@ export default function ReceiptPage() {
                       <div className="flex items-center justify-between gap-2">
                         <p className="text-sm font-medium text-[#d4dce8]">{formatActionLabel(action.action)}</p>
                         <p className="text-xs text-[#5a7a9a] flex-shrink-0">
-                          {new Date(action.created_at).toLocaleDateString('el-GR')}
+                          {parseTs(action.created_at)?.toLocaleDateString('el-GR') ?? '—'}
                         </p>
                       </div>
                       <p className="text-xs text-[#8aa0b8] mt-0.5">
@@ -408,9 +422,9 @@ export default function ReceiptPage() {
             <div id="receipt-print" className="p-8 space-y-6">
               {/* Header */}
               <div className="text-center border-b pb-6">
-                <h1 className="text-2xl font-bold text-[#071220]">{FIRM_NAME}</h1>
-                <p className="text-sm text-gray-600">{FIRM_ADDRESS}</p>
-                <p className="text-sm text-gray-600">{FIRM_PHONE} | {FIRM_EMAIL}</p>
+                <h1 className="text-2xl font-bold text-[#071220]">{firm.name}</h1>
+                <p className="text-sm text-gray-600">{firm.address}</p>
+                <p className="text-sm text-gray-600">{firm.phone}{firm.phone && firm.email ? ' | ' : ''}{firm.email}</p>
                 <h2 className="text-xl font-bold text-[#C6A75E] mt-4">ΑΠΟΔΕΙΞΗ ΠΑΡΟΧΗΣ ΥΠΗΡΕΣΙΩΝ</h2>
               </div>
 
@@ -438,7 +452,7 @@ export default function ReceiptPage() {
                   <tbody>
                     {receiptData.actions.slice(0, 15).map((action: ActionType, i: number) => (
                       <tr key={i} className={i % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
-                        <td className="border p-2">{new Date(action.created_at).toLocaleDateString('el-GR')}</td>
+                        <td className="border p-2">{parseTs(action.created_at)?.toLocaleDateString('el-GR') ?? '—'}</td>
                         <td className="border p-2">{formatActionLabel(action.action)}</td>
                         <td className="border p-2">{action.user_name || '—'}</td>
                       </tr>
@@ -469,7 +483,7 @@ export default function ReceiptPage() {
               {/* Footer */}
               <div className="text-center text-xs text-gray-500 border-t pt-4">
                 <p>Αυτή η απόδειξη επιβεβαιώνει ότι οι ανωτέρω υπηρεσίες παρασχέθησαν στον/στην ανωτέρω πελάτη.</p>
-                <p className="mt-2">{FIRM_NAME} | ΑΦΜ: {FIRM_AFM}</p>
+                <p className="mt-2">{firm.name}{firm.afm ? ` | ΑΦΜ: ${firm.afm}` : ''}</p>
               </div>
             </div>
 

@@ -81,9 +81,9 @@ export default function ReportsPage() {
         <>
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
             {[
-              { label: 'Πελάτες', value: stats.total_clients || 0, icon: Users, color: 'text-blue-400', border: 'border-blue-500/30', trend: '+5%' },
-              { label: 'Ενεργές Υποθέσεις', value: stats.active_cases || 0, icon: Briefcase, color: 'text-[#C6A75E]', border: 'border-[#C6A75E]/30', trend: '+2' },
-              { label: 'Collection Rate', value: `${Math.round(kpi?.financials?.collection_rate || 0)}%`, icon: TrendingUp, color: 'text-emerald-400', border: 'border-emerald-500/30', trend: '+3%' },
+              { label: 'Πελάτες', value: stats.total_clients || 0, icon: Users, color: 'text-blue-400', border: 'border-blue-500/30', trend: null },
+              { label: 'Ενεργές Υποθέσεις', value: stats.active_cases || 0, icon: Briefcase, color: 'text-[#C6A75E]', border: 'border-[#C6A75E]/30', trend: null },
+              { label: 'Collection Rate', value: `${Math.round(kpi?.financials?.collection_rate || 0)}%`, icon: TrendingUp, color: 'text-emerald-400', border: 'border-emerald-500/30', trend: null },
               { label: 'Ληξιπρόθεσμα', value: fmt(kpi?.financials?.overdue_amount || 0), icon: DollarSign, color: 'text-amber-400', border: 'border-amber-500/30', trend: null },
             ].map((s, i) => (
               <div key={i} className={`glass-card p-5 border-l-[3px] ${s.border}`}>

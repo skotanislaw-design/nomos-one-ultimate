@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Save, Shield, Bell, Building2, Lock, Users, Tag, Cloud, Bot, Link2, CreditCard, AlertCircle, CheckCircle, ExternalLink, Upload, RefreshCw, FolderOpen } from 'lucide-react';
+import { Save, Shield, Bell, Building2, Lock, Users, Tag, Cloud, Bot, Link2, CreditCard, AlertCircle, CheckCircle, ExternalLink, Upload, RefreshCw, FolderOpen, Mail, Loader2 } from 'lucide-react';
 import { settingsApi, gdriveApi } from '@/lib/api';
 import { usePermissions } from '@/hooks/usePermissions';
 import { SegmentTabs } from '@/components/ui/SegmentTabs';
@@ -165,6 +165,7 @@ export default function SettingsPage() {
   const [settings, setSettings] = useState<any>({});
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<SettingsTab>('general');
+  const [testingEmail, setTestingEmail] = useState(false);
   const perms = usePermissions();
 
   useEffect(() => {
@@ -174,6 +175,24 @@ export default function SettingsPage() {
   const handleSave = async () => {
     try { await settingsApi.update(settings); toast.success('Ρυθμίσεις αποθηκεύτηκαν'); }
     catch { toast.error('Σφάλμα αποθήκευσης'); }
+  };
+
+  const handleTestEmail = async () => {
+    if (!settings.smtp_host || !settings.smtp_user) {
+      toast.error('Συμπληρώστε πρώτα SMTP Server και Username');
+      return;
+    }
+    setTestingEmail(true);
+    try {
+      await handleSave();
+      await settingsApi.sendTestEmail(settings.smtp_user);
+      toast.success(`Δοκιμαστικό email στάλθηκε στο ${settings.smtp_user}`);
+    } catch (err: any) {
+      const detail = err.response?.data?.detail || err.message || 'Σφάλμα';
+      toast.error(`Αποτυχία: ${detail}`);
+    } finally {
+      setTestingEmail(false);
+    }
   };
 
   const tabs = [
@@ -255,12 +274,22 @@ export default function SettingsPage() {
             </div>
           ))}
 
-          <div><label className="label">SMTP Server</label><input value={settings.smtp_host || ''} onChange={e => setSettings({...settings, smtp_host: e.target.value})} placeholder="smtp.gmail.com" className="input-dark" disabled={!perms.isAdmin} /></div>
+          <div><label className="label">SMTP Server</label><input value={settings.smtp_host || ''} onChange={e => setSettings({...settings, smtp_host: e.target.value})} placeholder="smtp.office365.com" className="input-dark" disabled={!perms.isAdmin} /></div>
           <div className="grid grid-cols-2 gap-3">
             <div><label className="label">SMTP Port</label><input type="number" value={settings.smtp_port || 587} onChange={e => setSettings({...settings, smtp_port: Number(e.target.value)})} className="input-dark" disabled={!perms.isAdmin} /></div>
-            <div><label className="label">SMTP Username</label><input value={settings.smtp_user || ''} onChange={e => setSettings({...settings, smtp_user: e.target.value})} placeholder="noreply@domain.com" className="input-dark" disabled={!perms.isAdmin} /></div>
+            <div><label className="label">SMTP Username</label><input value={settings.smtp_user || ''} onChange={e => setSettings({...settings, smtp_user: e.target.value})} placeholder="christos@skotanislaw.com" className="input-dark" disabled={!perms.isAdmin} /></div>
           </div>
-          {perms.isAdmin && <button onClick={handleSave} className="btn-gold flex items-center gap-1.5"><Save size={14} /> Αποθήκευση</button>}
+          <div><label className="label">SMTP Password</label><input type="password" value={settings.smtp_pass || ''} onChange={e => setSettings({...settings, smtp_pass: e.target.value})} placeholder="••••••••••••" className="input-dark" disabled={!perms.isAdmin} autoComplete="new-password" /></div>
+          <div><label className="label">Email Αποστολέα (From)</label><input value={settings.notification_email || ''} onChange={e => setSettings({...settings, notification_email: e.target.value})} placeholder="christos@skotanislaw.com" className="input-dark" disabled={!perms.isAdmin} /></div>
+          {perms.isAdmin && (
+            <div className="flex gap-2">
+              <button onClick={handleSave} className="btn-gold flex items-center gap-1.5"><Save size={14} /> Αποθήκευση</button>
+              <button onClick={handleTestEmail} disabled={testingEmail} className="btn-secondary flex items-center gap-1.5 disabled:opacity-50">
+                {testingEmail ? <Loader2 size={14} className="animate-spin" /> : <Mail size={14} />}
+                Δοκιμαστικό Email
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -298,7 +327,9 @@ export default function SettingsPage() {
               <button onClick={() => setSettings({...settings, [key]: !settings[key]})} disabled={!perms.isAdmin} className={`w-11 h-6 rounded-full transition-colors ${settings[key] ? 'bg-purple-500' : 'bg-[#1a3a5c]'}`}><div className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${settings[key] ? 'translate-x-5' : 'translate-x-0.5'}`} /></button>
             </div>
           ))}
-          <div><label className="label">AI Language Model</label><select value={settings.ai_model || 'gpt-4'} onChange={e => setSettings({...settings, ai_model: e.target.value})} className="input-dark max-w-xs" disabled={!perms.isAdmin}><option value="gpt-4">GPT-4 (Προεπιλογή)</option><option value="claude-3">Claude 3</option><option value="gemini">Gemini Pro</option></select></div>
+          <div className="p-3 rounded-lg bg-[#0d2035]/40 border border-[#1a3a5c]/20">
+            <p className="text-xs text-[#5a7a9a]">Το σύστημα χρησιμοποιεί <strong className="text-[#c0d0e0]">Claude Sonnet</strong> (Anthropic) για Document Intake και AI βοηθό. Η επιλογή μοντέλου γίνεται από τη διαχείριση backend.</p>
+          </div>
           {perms.isAdmin && <button onClick={handleSave} className="btn-gold flex items-center gap-1.5"><Save size={14} /> Αποθήκευση</button>}
         </div>
       )}
@@ -325,7 +356,7 @@ export default function SettingsPage() {
       {activeTab === 'team' && (
         <div className="glass-card p-6 space-y-5">
           <div className="flex items-center gap-2 mb-2"><Users size={16} className="text-[#C6A75E]" /><h3 className="section-title">Διαχείριση Ομάδας</h3></div>
-          <p className="text-sm text-[#7a9ab8]">Η διαχείριση χρηστών γίνεται από τη σελίδα <button onClick={() => {}} className="text-[#C6A75E] hover:underline">Χρήστες</button>.</p>
+          <p className="text-sm text-[#7a9ab8]">Η διαχείριση χρηστών γίνεται από τη σελίδα <button onClick={() => { window.history.pushState({}, '', '/users'); window.dispatchEvent(new PopStateEvent('popstate')); }} className="text-[#C6A75E] hover:underline">Χρήστες</button>.</p>
           <div className="grid grid-cols-2 gap-4">
             <div><label className="label">Μέγιστος αριθμός χρηστών</label><input type="number" value={settings.max_users || 10} onChange={e => setSettings({...settings, max_users: Number(e.target.value)})} className="input-dark" disabled={!perms.isAdmin} /></div>
             <div><label className="label">Default ρόλος νέου χρήστη</label><select value={settings.default_role || 'associate'} onChange={e => setSettings({...settings, default_role: e.target.value})} className="input-dark" disabled={!perms.isAdmin}><option value="associate">Συνεργάτης</option><option value="trainee">Ασκούμενος</option><option value="readonly">Μόνο Ανάγνωση</option></select></div>

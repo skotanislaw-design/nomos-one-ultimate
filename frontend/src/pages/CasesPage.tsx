@@ -6,19 +6,20 @@ import DocumentScanButton, { ExtractedData } from '@/components/DocumentScanButt
 import { usePermissions } from '@/hooks/usePermissions';
 import { SegmentTabs } from '@/components/ui/SegmentTabs';
 import { toast } from 'sonner';
+import { parseTs } from '@/lib/prefs';
 
 const STATUS_MAP: Record<string, string> = {
   open: 'status-active', in_progress: 'status-info', closed_won: 'status-active',
   closed_lost: 'status-closed', hearing: 'status-pending', appeal: 'status-urgent',
 };
 const STATUS_LABELS: Record<string, string> = {
-  open: 'Ανοικτή', in_progress: 'Σε Εξέλιξη', hearing: 'Ακροαματήριο',
+  open: 'Ανοικτή', in_progress: 'Σε Εξέλιξη', hearing: 'Ακροατήριο',
   appeal: 'Έφεση', closed_won: 'Κερδήθηκε', closed_lost: 'Απώλεια',
   closed_settled: 'Συμβιβασμός', archived: 'Αρχείο',
 };
 
 type StatusTab = 'all' | 'open' | 'in_progress' | 'hearing' | 'appeal' | 'closed' | 'pending';
-type SortKey = 'title' | 'client_name' | 'category' | 'status' | 'created_at';
+type SortKey = 'offense' | 'client_name' | 'legal_category' | 'law_articles' | 'status' | 'created_at';
 
 export default function CasesPage() {
   const [cases, setCases] = useState<any[]>([]);
@@ -66,11 +67,12 @@ export default function CasesPage() {
         title: cs.title || prev.title,
         category: cs.category || prev.category,
         summary: [cs.summary, cs.court ? 'Δικαστήριο: ' + cs.court : null, cs.opposing_party ? 'Αντίδικος: ' + cs.opposing_party : null].filter(Boolean).join(' | ') || prev.summary,
+        offense: prev.offense || cs.title || '',
       }));
     }
   };
 
-  const [form, setForm] = useState({ title: '', client_id: '', category: 'ποινικό', summary: '' });
+  const [form, setForm] = useState({ title: '', client_id: '', category: '', summary: '', offense: '', law_articles: '' });
   const perms = usePermissions();
 
   const load = () => {
@@ -80,18 +82,28 @@ export default function CasesPage() {
   };
   useEffect(() => { load(); loadPending(); }, []);
 
+  const getSortVal = (c: any, key: SortKey): string => {
+    if (key === 'offense') return c.offense || c.title || '';
+    if (key === 'legal_category') return c.legal_category || '';
+    return c[key] || '';
+  };
+
   const filtered = cases
     .filter(c => {
-      const ms = (c.title || '').toLowerCase().includes(search.toLowerCase()) || (c.case_number || '').toLowerCase().includes(search.toLowerCase());
+      const q = search.toLowerCase();
+      const ms = !q || [c.title, c.case_number, c.client_name, c.offense, c.law_articles, c.legal_category]
+        .some(v => (v || '').toLowerCase().includes(q));
       const mst = activeTab === 'all' ? true
         : activeTab === 'closed' ? c.status?.startsWith('closed')
         : c.status === activeTab;
       return ms && mst;
     })
     .sort((a, b) => {
-      const av = a[sortKey] || '';
-      const bv = b[sortKey] || '';
-      const cmp = String(av).localeCompare(String(bv), 'el');
+      const av = getSortVal(a, sortKey);
+      const bv = getSortVal(b, sortKey);
+      const cmp = sortKey === 'created_at'
+        ? new Date(av).getTime() - new Date(bv).getTime()
+        : String(av).localeCompare(String(bv), 'el');
       return sortAsc ? cmp : -cmp;
     });
 
@@ -99,16 +111,17 @@ export default function CasesPage() {
     tab === 'all' ? true : tab === 'closed' ? c.status?.startsWith('closed') : c.status === tab
   ).length;
 
-  const tabs: { id: StatusTab; label: string }[] = [
+  const tabs = (([
     { id: 'all', label: 'Όλες' }, { id: 'open', label: 'Ανοικτές' },
-    { id: 'in_progress', label: 'Σε Εξέλιξη' }, { id: 'hearing', label: 'Ακροαματήριο' },
+    { id: 'in_progress', label: 'Σε Εξέλιξη' }, { id: 'hearing', label: 'Ακροατήριο' },
     { id: 'appeal', label: 'Έφεση' }, { id: 'closed', label: 'Κλειστές' },
     { id: 'pending', label: `Εκκρεμείς${pendingIntakes.length > 0 ? ` (${pendingIntakes.length})` : ''}` },
-  ].map(t => ({ ...t, count: t.id === 'pending' ? pendingIntakes.length : count(t.id) }));
+  ] as Array<{ id: StatusTab; label: string }>)).map(t => ({ ...t, count: t.id === 'pending' ? pendingIntakes.length : count(t.id) }));
 
   const handleAdd = async (e: React.FormEvent) => {
     e.preventDefault();
-    try { await casesApi.create(form); toast.success('Υπόθεση δημιουργήθηκε'); setShowAdd(false); load(); }
+    if (!form.category) { toast.error('Η κατηγορία υπόθεσης είναι υποχρεωτική'); return; }
+    try { await casesApi.create({ ...form, title: form.title || form.offense }); toast.success('Υπόθεση δημιουργήθηκε'); setShowAdd(false); load(); }
     catch (err: any) { toast.error(err.response?.data?.detail || 'Σφάλμα'); }
   };
 
@@ -140,8 +153,8 @@ export default function CasesPage() {
   );
 
   const exportCSV = () => {
-    const headers = ['Κωδικός', 'Τίτλος', 'Πελάτης', 'Κατηγορία', 'Κατάσταση'];
-    const rows = filtered.map(c => [c.case_number || '', c.title || '', c.client_name || '', c.category || '', STATUS_LABELS[c.status] || c.status || '']);
+    const headers = ['Κωδικός', 'Αδίκημα', 'Εντολέας', 'Κατηγορία', 'Άρθρα ΠΚ', 'Κατάσταση'];
+    const rows = filtered.map(c => [c.case_number || '', c.offense || c.title || '', (c.client_names || [c.client_name]).join(', '), c.legal_category || '', c.law_articles || '', STATUS_LABELS[c.status] || c.status || '']);
     const csv = [headers, ...rows].map(r => r.map(v => `"${v}"`).join(',')).join('\n');
     const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -209,7 +222,15 @@ export default function CasesPage() {
                       <span className={`text-[10px] font-mono ${confColor}`}>AI: {conf}</span>
                       <span className="text-[10px] text-[#5a7a9a]">{pi.source?.toUpperCase()} · {pi.submitted_by}</span>
                     </div>
-                    <p className="font-semibold text-[#d4dce8] truncate">👤 {pi.client_name}</p>
+                    {pi.client_names && pi.client_names.length > 1 ? (
+                      <div className="flex flex-wrap gap-1 mb-0.5">
+                        {pi.client_names.map((n: string, i: number) => (
+                          <span key={i} className="text-xs font-semibold text-[#d4dce8] bg-[#0d2035] border border-[#1a3a5c]/50 rounded px-1.5 py-0.5">👤 {n}</span>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="font-semibold text-[#d4dce8] truncate">👤 {pi.client_name}</p>
+                    )}
                     <p className="text-xs text-[#8aa0b8] truncate mt-0.5">📁 {cs.title || '—'}</p>
                     {ext.summary && <p className="text-xs text-[#5a7a9a] mt-1 line-clamp-2">{ext.summary}</p>}
                     <div className="flex flex-wrap gap-1 mt-2">
@@ -243,31 +264,54 @@ export default function CasesPage() {
           })}
         </div>
       ) : (
-      <div className="glass-card overflow-hidden">
+      <div className="glass-card overflow-hidden table-scroll">
         <table className="w-full table-premium">
           <thead>
             <tr className="bg-[#0d2035]/40">
-              <th><SortBtn col="title" label="Τίτλος" /></th>
-              <th className="hidden md:table-cell"><SortBtn col="client_name" label="Πελάτης" /></th>
-              <th className="hidden sm:table-cell"><SortBtn col="category" label="Κατηγορία" /></th>
+              <th><SortBtn col="offense" label="Αδίκημα" /></th>
+              <th><SortBtn col="client_name" label="Εντολέας" /></th>
+              <th className="hidden sm:table-cell"><SortBtn col="legal_category" label="Κατηγορία" /></th>
+              <th className="hidden lg:table-cell"><SortBtn col="law_articles" label="Άρθρα ΠΚ" /></th>
               <th><SortBtn col="status" label="Κατάσταση" /></th>
+              <th><SortBtn col="created_at" label="Ημ/νία" /></th>
               <th>Ενέργειες</th>
             </tr>
           </thead>
           <tbody>
-            {filtered.map(c => (
+            {filtered.map(c => {
+              const displayClients = c.client_names && c.client_names.length > 1
+                ? c.client_names
+                : [c.client_name || '—'];
+              return (
               <tr key={c._id || c.id}>
                 <td>
                   <div>
-                    <p className="font-medium text-[#d4dce8] truncate max-w-[200px]">{c.title}</p>
+                    <p className="font-medium text-[#d4dce8] truncate max-w-[220px]" title={c.offense || c.title}>
+                      {c.offense || c.title || '—'}
+                    </p>
                     <p className="text-[10px] font-mono text-[#C6A75E]">{c.case_number || '—'}</p>
                   </div>
                 </td>
-                <td className="hidden md:table-cell text-xs">{c.client_name || '—'}</td>
+                <td>
+                  <div className="space-y-0.5">
+                    {displayClients.map((n: string, i: number) => (
+                      <p key={i} className="text-xs text-[#b0c4d8] truncate max-w-[160px]" title={n}>{n}</p>
+                    ))}
+                  </div>
+                </td>
                 <td className="hidden sm:table-cell">
-                  <span className="px-2 py-0.5 rounded text-[10px] bg-[#132B45] text-[#8aa0b8] border border-[#1a3a5c]/40">{c.category || '—'}</span>
+                  <span className="px-2 py-0.5 rounded text-[10px] bg-[#132B45] text-[#8aa0b8] border border-[#1a3a5c]/40 whitespace-nowrap">{c.legal_category || '—'}</span>
+                </td>
+                <td className="hidden lg:table-cell">
+                  {c.law_articles
+                    ? <span className="text-[10px] font-mono text-[#C6A75E] bg-[#0d2035] border border-[#C6A75E]/20 px-1.5 py-0.5 rounded">{c.law_articles}</span>
+                    : <span className="text-[10px] text-[#3a5a7a]">—</span>
+                  }
                 </td>
                 <td><span className={STATUS_MAP[c.status] || 'status-pending'}>{STATUS_LABELS[c.status] || c.status}</span></td>
+                <td className="text-[10px] text-[#5a7a9a] whitespace-nowrap">
+                  {c.created_at ? (parseTs(c.created_at)?.toLocaleDateString('el-GR', { day:'2-digit', month:'2-digit', year:'2-digit' }) ?? '—') : '—'}
+                </td>
                 <td>
                   <div className="flex items-center gap-1">
                     <button onClick={() => setSummaryCase(c)} title="Σύνοψη"
@@ -287,7 +331,8 @@ export default function CasesPage() {
                   </div>
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
         {filtered.length === 0 && <div className="py-12 text-center text-[#5a7a9a] text-sm">Δεν βρέθηκαν υποθέσεις.</div>}
@@ -301,8 +346,17 @@ export default function CasesPage() {
             <div className="p-5 border-b border-[#1a3a5c]/40 flex items-start justify-between gap-3 shrink-0">
               <div className="min-w-0">
                 <p className="text-[10px] font-mono text-[#C6A75E] mb-1">{summaryCase.case_number || '—'}</p>
-                <h3 className="text-base font-bold text-white leading-tight">{summaryCase.title}</h3>
-                <p className="text-xs text-[#7a9ab8] mt-0.5">{summaryCase.client_name || '—'}</p>
+                <h3 className="text-base font-bold text-white leading-tight">{summaryCase.offense || summaryCase.title}</h3>
+                {summaryCase.offense && summaryCase.title !== summaryCase.offense && (
+                  <p className="text-[10px] text-[#5a7a9a] italic mt-0.5">{summaryCase.title}</p>
+                )}
+                {summaryCase.law_articles && (
+                  <p className="text-[10px] font-mono text-[#C6A75E]/80 mt-0.5">{summaryCase.law_articles}</p>
+                )}
+                {(() => {
+                  const names = (summaryCase.client_names?.length > 1 ? summaryCase.client_names : [summaryCase.client_name]).filter(Boolean);
+                  return names.length ? <p className="text-xs text-[#7a9ab8] mt-1">{names.join(' · ')}</p> : null;
+                })()}
               </div>
               <button onClick={() => setSummaryCase(null)} className="p-1.5 rounded-lg hover:bg-[#132B45] text-[#7a9ab8] shrink-0"><X size={16} /></button>
             </div>
@@ -329,6 +383,7 @@ export default function CasesPage() {
                 {summaryCase.court && <div><p className="text-[10px] text-[#5a7a9a] uppercase tracking-wider">Δικαστήριο</p><p className="text-xs text-[#b0c4d8] mt-0.5">{summaryCase.court}</p></div>}
                 {summaryCase.opposing_party && <div><p className="text-[10px] text-[#5a7a9a] uppercase tracking-wider">Αντίδικος</p><p className="text-xs text-[#b0c4d8] mt-0.5">{summaryCase.opposing_party}</p></div>}
                 {summaryCase.legal_category && <div><p className="text-[10px] text-[#5a7a9a] uppercase tracking-wider">Κατηγορία</p><p className="text-xs text-[#b0c4d8] mt-0.5">{summaryCase.legal_category}</p></div>}
+                {summaryCase.law_articles && <div><p className="text-[10px] text-[#5a7a9a] uppercase tracking-wider">Άρθρα ΠΚ/Νόμου</p><p className="text-xs font-mono text-[#C6A75E] mt-0.5">{summaryCase.law_articles}</p></div>}
                 {summaryCase.ai_confidence && <div><p className="text-[10px] text-[#5a7a9a] uppercase tracking-wider">Αξιοπιστία AI</p><p className={`text-xs mt-0.5 font-semibold ${summaryCase.ai_confidence==='high'?'text-green-400':summaryCase.ai_confidence==='medium'?'text-yellow-400':'text-red-400'}`}>{summaryCase.ai_confidence}</p></div>}
               </div>
             </div>
@@ -350,10 +405,14 @@ export default function CasesPage() {
             </div>
             <form onSubmit={handleAdd} className="p-6 space-y-4">
               <DocumentScanButton onExtracted={handleScanExtract} className="w-full mb-2" />
-              <div><label className="label">Τίτλος</label><input value={form.title} onChange={e => setForm({...form, title: e.target.value})} className="input-dark" required /></div>
+              <div><label className="label">Αδίκημα / Σύντομος Τίτλος <span className="text-[#C6A75E]">*</span></label><input value={form.offense} onChange={e => setForm({...form, offense: e.target.value})} className="input-dark" placeholder="π.χ. Κλοπή, Σωματικές Βλάβες, Τροχαίο με τραυματισμό" required /></div>
               <div className="grid grid-cols-2 gap-3">
-                <div><label className="label">Πελάτης</label><select value={form.client_id} onChange={e => setForm({...form, client_id: e.target.value})} className="input-dark"><option value="">Επιλέξτε...</option>{clients.map(cl => <option key={cl._id || cl.id} value={cl._id || cl.id}>{cl.full_name}</option>)}</select></div>
-                <div><label className="label">Κατηγορία</label><select value={form.category} onChange={e => setForm({...form, category: e.target.value})} className="input-dark">{['ποινικό','αστικό','διοικητικό','εμπορικό','εργατικό','οικογενειακό','ακίνητα','φορολογικό'].map(c => <option key={c}>{c}</option>)}</select></div>
+                <div><label className="label">Πλήρης Τίτλος</label><input value={form.title} onChange={e => setForm({...form, title: e.target.value})} className="input-dark" placeholder="Πλήρης τίτλος υπόθεσης" /></div>
+                <div><label className="label">Άρθρα ΠΚ/Νόμου</label><input value={form.law_articles} onChange={e => setForm({...form, law_articles: e.target.value})} className="input-dark" placeholder="π.χ. ΠΚ 372, ΠΚ 386§1" /></div>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div><label className="label">Εντολέας</label><select value={form.client_id} onChange={e => setForm({...form, client_id: e.target.value})} className="input-dark" required><option value="">Επιλέξτε...</option>{clients.map(cl => <option key={cl._id || cl.id} value={cl._id || cl.id}>{cl.full_name}</option>)}</select></div>
+                <div><label className="label">Κατηγορία <span className="text-[#C6A75E]">*</span></label><select value={form.category} onChange={e => setForm({...form, category: e.target.value})} className="input-dark" required><option value="">Επιλέξτε κατηγορία...</option>{['ποινικό','αστικό','διοικητικό','εμπορικό','εργατικό','οικογενειακό','ακίνητα','φορολογικό'].map(c => <option key={c} value={c}>{c}</option>)}</select></div>
               </div>
               <div><label className="label">Περιγραφή</label><textarea value={form.summary} onChange={e => setForm({...form, summary: e.target.value})} className="input-dark h-20 resize-none" /></div>
               <div className="flex gap-2 pt-2">

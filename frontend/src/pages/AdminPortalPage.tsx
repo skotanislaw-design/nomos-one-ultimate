@@ -5,7 +5,7 @@ import { usePermissions } from '@/hooks/usePermissions';
 import { toast } from 'sonner';
 
 interface PortalAccessCode {
-  _id: string;
+  id: string;
   case_id: string;
   client_id: string;
   portal_code: string;
@@ -223,7 +223,7 @@ export default function AdminPortalPage() {
 
       {/* Active Portal Access Codes */}
       {accessCodes.length > 0 && (
-        <div className="glass-card overflow-hidden border border-[#1a3a5c]">
+        <div className="glass-card overflow-hidden table-scroll border border-[#1a3a5c]">
           <div className="p-5 border-b border-[#1a3a5c]/40">
             <h3 className="section-title">Ενεργοί Κωδικοί Πρόσβασης</h3>
           </div>
@@ -241,7 +241,7 @@ export default function AdminPortalPage() {
               </thead>
               <tbody>
                 {accessCodes.map(code => (
-                  <tr key={code._id}>
+                  <tr key={code.id}>
                     <td className="font-mono text-sm text-[#C6A75E] flex items-center gap-2">
                       {code.portal_code}
                       <button
@@ -257,13 +257,13 @@ export default function AdminPortalPage() {
                     </td>
                     <td className="hidden md:table-cell text-xs text-[#8aa0b8]">
                       <button
-                        onClick={() => setShowPermissions(showPermissions === code._id ? null : code._id)}
+                        onClick={() => setShowPermissions(showPermissions === code.id ? null : code.id)}
                         className="inline-flex items-center gap-1 text-[#C6A75E] hover:underline"
                       >
                         {code.permissions.length} δικαιώματα
-                        {showPermissions === code._id ? <EyeOff size={12} /> : <Eye size={12} />}
+                        {showPermissions === code.id ? <EyeOff size={12} /> : <Eye size={12} />}
                       </button>
-                      {showPermissions === code._id && (
+                      {showPermissions === code.id && (
                         <div className="mt-2 p-2 bg-[#0d2035]/40 rounded text-[10px] text-[#8aa0b8] space-y-1">
                           {code.permissions.map(p => (
                             <div key={p}>• {AVAILABLE_PERMISSIONS.find(ap => ap.key === p)?.label || p}</div>
@@ -281,8 +281,8 @@ export default function AdminPortalPage() {
                       <button
                         onClick={async () => {
                           try {
-                            await adminPortalApi.deletePortalAccess(code._id);
-                            setAccessCodes(accessCodes.filter(c => c._id !== code._id));
+                            await adminPortalApi.deletePortalAccess(code.id);
+                            setAccessCodes(accessCodes.filter(c => c.id !== code.id));
                             toast.success('Κωδικός διαγράφηκε');
                           } catch {
                             toast.error('Σφάλμα διαγραφής');
@@ -304,7 +304,7 @@ export default function AdminPortalPage() {
 
       {/* Password Reset Requests */}
       {resetRequests.length > 0 && (
-        <div className="glass-card overflow-hidden border border-amber-500/20">
+        <div className="glass-card overflow-hidden table-scroll border border-amber-500/20">
           <div className="p-5 border-b border-amber-500/20 bg-amber-500/5">
             <div className="flex items-center gap-2">
               <AlertCircle size={18} className="text-amber-400" />

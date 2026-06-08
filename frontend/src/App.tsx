@@ -9,6 +9,7 @@ import LoginPage from '@/pages/LoginPage';
 import ClientPortalLoginPage from '@/pages/ClientPortalLoginPage';
 import ClientPortalPage from '@/pages/ClientPortalPage';
 import { initializeFirebase } from '@/lib/firebase';
+import PaymentGateModal from '@/components/PaymentGateModal';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
@@ -50,6 +51,7 @@ export default function App() {
       <WebSocketProvider>
         <PortalAuthProvider>
           <Toaster position="top-right" theme="dark" richColors />
+          <PaymentGateModal />
           <Routes>
           {/* Main app routes */}
           <Route path="/login" element={<LoginPage />} />

@@ -6,6 +6,7 @@ import {
   Download, Trash2, Mail, Eye, AlertTriangle, FileSpreadsheet, TrendingUp,
 } from 'lucide-react';
 import { casesApi, hearingsApi, paymentsApi, invoicingApi, exportApi, emailApi } from '@/lib/api';
+import { parseTs } from '@/lib/prefs';
 import { SegmentTabs } from '@/components/ui/SegmentTabs';
 import { usePermissions } from '@/hooks/usePermissions';
 import { useWebSocketContext } from '@/contexts/WebSocketContext';
@@ -97,7 +98,7 @@ export default function CaseDetailPage() {
     // Ακούγε για ενημερώσεις της υπόθεσης
     const unsubCase = ws.on('case.updated', (event) => {
       if (event.case_id === id) {
-        setCase(prev => ({ ...prev, ...event.data }));
+        setCase((prev: any) => ({ ...prev, ...event.data }));
         setIsSynced(true);
         setTimeout(() => setIsSynced(false), 2000); // Δείχνει ένδειξη 2 δευτ.
       }
@@ -117,7 +118,7 @@ export default function CaseDetailPage() {
       }
     });
 
-    // Ακούγε για νέα ακροαματήρια
+    // Ακούγε για νέα ακροατήρια
     const unsubHearing = ws.on('hearing.created', (event) => {
       if (event.case_id === id) {
         setHearings(prev => [event.data, ...prev]);
@@ -176,7 +177,7 @@ export default function CaseDetailPage() {
         case_id: id,
         hearing_date: new Date(hearingForm.hearing_date).toISOString(),
       });
-      toast.success('Ακροαματήριο προστέθηκε');
+      toast.success('Ακροατήριο προστέθηκε');
       setShowHearingForm(false);
       setHearingForm({ court: '', hearing_date: '', judge: '', notes: '', status: 'scheduled' });
       const r = await hearingsApi.forCase(id);
@@ -248,7 +249,7 @@ export default function CaseDetailPage() {
 
   const tabs = [
     { id: 'overview' as DetailTab, label: 'Επισκόπηση' },
-    { id: 'hearings' as DetailTab, label: 'Ακροαματήρια', count: hearings.length },
+    { id: 'hearings' as DetailTab, label: 'Ακροατήρια', count: hearings.length },
     { id: 'payments' as DetailTab, label: 'Πληρωμές', count: payments.length },
     { id: 'documents' as DetailTab, label: 'Έγγραφα', count: docs.length },
     { id: 'notes' as DetailTab, label: 'Σημειώσεις', count: notes.length },
@@ -272,10 +273,12 @@ export default function CaseDetailPage() {
             <div className="flex items-center gap-2 mb-2 flex-wrap">
               <span className="font-mono text-xs text-[#C6A75E] bg-[#C6A75E]/10 px-2 py-0.5 rounded">{c.case_number}</span>
               <span className="status-active">{c.status}</span>
-              <span className="px-2 py-0.5 rounded text-[10px] bg-[#132B45] text-[#8aa0b8] border border-[#1a3a5c]/40">{c.category || c.legal_category}</span>
+              <span className="px-2 py-0.5 rounded text-[10px] bg-[#132B45] text-[#8aa0b8] border border-[#1a3a5c]/40">{c.legal_category || c.category}</span>
+              {c.law_articles && <span className="font-mono text-[10px] text-[#C6A75E] bg-[#C6A75E]/10 border border-[#C6A75E]/20 px-2 py-0.5 rounded">{c.law_articles}</span>}
             </div>
-            <h2 className="page-title mb-1">{c.title}</h2>
-            {c.summary && <p className="text-sm text-[#7a9ab8]">{c.summary}</p>}
+            <h2 className="page-title mb-1">{c.offense || c.title}</h2>
+            {c.offense && c.title !== c.offense && <p className="text-xs text-[#5a7a9a] italic mb-1">{c.title}</p>}
+            {c.description && <p className="text-sm text-[#7a9ab8]">{c.description}</p>}
           </div>
           <SegmentTabs tabs={tabs} active={activeTab} onChange={setActiveTab} size="sm" />
         </div>
@@ -285,8 +288,27 @@ export default function CaseDetailPage() {
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="glass-card p-4 border-l-[3px] border-blue-500/30">
           <Users size={15} className="text-blue-400 mb-2" />
-          <p className="text-sm font-semibold text-[#d4dce8] truncate">{c.client_name || '—'}</p>
-          <p className="text-[10px] text-[#5a7a9a] uppercase tracking-wider">Πελάτης</p>
+          {c.clients && c.clients.length > 1 ? (
+            <div className="space-y-1">
+              {c.clients.map((cl: any) => (
+                <button key={cl.id || cl._id}
+                  onClick={() => nav('/clients')}
+                  className="block text-xs font-semibold text-[#d4dce8] hover:text-[#C6A75E] transition-colors truncate text-left w-full"
+                  title={cl.full_name}>
+                  {cl.full_name}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <button onClick={() => nav('/clients')}
+              className="text-sm font-semibold text-[#d4dce8] hover:text-[#C6A75E] transition-colors truncate text-left block w-full"
+              title={c.client_name}>
+              {c.client_name || '—'}
+            </button>
+          )}
+          <p className="text-[10px] text-[#5a7a9a] uppercase tracking-wider mt-1">
+            {c.clients && c.clients.length > 1 ? `${c.clients.length} Εντολείς` : 'Εντολέας'}
+          </p>
         </div>
         <div className="glass-card p-4 border-l-[3px] border-[#C6A75E]/30">
           <TrendingUp size={15} className="text-[#C6A75E] mb-2" />
@@ -354,7 +376,7 @@ export default function CaseDetailPage() {
                     <div key={inv._id || inv.id} className="flex items-center justify-between p-2.5 rounded-lg bg-[#0d2035]/40 border border-[#1a3a5c]/20">
                       <div>
                         <p className="text-xs font-mono text-[#C6A75E]">#{inv.invoice_number || inv._id?.slice(-6)}</p>
-                        <p className="text-xs text-[#5a7a9a]">{inv.created_at ? new Date(inv.created_at).toLocaleDateString('el-GR') : ''}</p>
+                        <p className="text-xs text-[#5a7a9a]">{inv.created_at ? parseTs(inv.created_at).toLocaleDateString('el-GR') : ''}</p>
                       </div>
                       <div className="flex items-center gap-2">
                         <span className="font-mono text-sm text-[#C6A75E]">{fmt(Number(inv.total || inv.amount || 0))}</span>
@@ -381,14 +403,14 @@ export default function CaseDetailPage() {
         <div className="space-y-4">
           <div className="flex justify-end">
             <button onClick={() => setShowHearingForm(true)} className="btn-gold text-xs flex items-center gap-1.5">
-              <Plus size={13} /> Νέο Ακροαματήριο
+              <Plus size={13} /> Νέο Ακροατήριο
             </button>
           </div>
 
           {hearings.length === 0 ? (
             <div className="glass-card p-10 text-center">
               <Gavel size={36} className="mx-auto text-[#2a4a6a] mb-3" />
-              <p className="text-sm text-[#5a7a9a]">Δεν υπάρχουν ακροαματήρια.</p>
+              <p className="text-sm text-[#5a7a9a]">Δεν υπάρχουν ακροατήρια.</p>
             </div>
           ) : (
             <div className="space-y-3">
@@ -401,7 +423,7 @@ export default function CaseDetailPage() {
                           {HEARING_STATUS_LABELS[h.status] || h.status}
                         </span>
                         <span className="text-xs font-mono text-[#C6A75E]">
-                          {h.hearing_date ? new Date(h.hearing_date).toLocaleDateString('el-GR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }) : '—'}
+                          {h.hearing_date ? parseTs(h.hearing_date).toLocaleDateString('el-GR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }) : '—'}
                         </span>
                       </div>
                       <p className="text-sm font-semibold text-[#d4dce8]">{h.court}</p>
@@ -414,7 +436,7 @@ export default function CaseDetailPage() {
                       )}
                       {h.next_hearing && (
                         <p className="text-xs text-amber-400 mt-2">
-                          Επόμενο: {new Date(h.next_hearing).toLocaleDateString('el-GR')}
+                          Επόμενο: {parseTs(h.next_hearing).toLocaleDateString('el-GR')}
                         </p>
                       )}
                     </div>
@@ -435,7 +457,7 @@ export default function CaseDetailPage() {
             <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={() => setShowHearingForm(false)}>
               <div className="glass-card w-full max-w-lg border border-[#1a3a5c]" onClick={e => e.stopPropagation()}>
                 <div className="p-6 border-b border-[#1a3a5c]/40 flex items-center justify-between">
-                  <h3 className="text-lg font-bold text-white">Νέο Ακροαματήριο</h3>
+                  <h3 className="text-lg font-bold text-white">Νέο Ακροατήριο</h3>
                   <button onClick={() => setShowHearingForm(false)} className="p-2 rounded-lg hover:bg-[#132B45] text-[#7a9ab8]"><X size={18} /></button>
                 </div>
                 <form onSubmit={addHearing} className="p-6 space-y-4">
@@ -492,7 +514,7 @@ export default function CaseDetailPage() {
               <p className="text-sm text-[#5a7a9a]">Δεν υπάρχουν πληρωμές για αυτή την υπόθεση.</p>
             </div>
           ) : (
-            <div className="glass-card overflow-hidden">
+            <div className="glass-card overflow-hidden table-scroll">
               <table className="w-full table-premium">
                 <thead>
                   <tr className="bg-[#0d2035]/40">
@@ -506,7 +528,7 @@ export default function CaseDetailPage() {
                 <tbody>
                   {payments.map((p: any) => (
                     <tr key={p._id || p.id}>
-                      <td className="text-xs">{p.payment_date ? new Date(p.payment_date).toLocaleDateString('el-GR') : '—'}</td>
+                      <td className="text-xs">{p.payment_date ? parseTs(p.payment_date).toLocaleDateString('el-GR') : '—'}</td>
                       <td className="text-xs capitalize">{p.payment_method?.replace('_', ' ') || '—'}</td>
                       <td className="hidden sm:table-cell text-xs font-mono text-[#5a7a9a]">{p.reference || '—'}</td>
                       <td className="hidden md:table-cell text-xs text-[#7a9ab8]">{p.notes || '—'}</td>
@@ -568,7 +590,7 @@ export default function CaseDetailPage() {
               <p className="text-sm text-[#5a7a9a]">Κανένα έγγραφο ακόμα.</p>
             </div>
           ) : (
-            <div className="glass-card overflow-hidden">
+            <div className="glass-card overflow-hidden table-scroll">
               <table className="w-full table-premium">
                 <thead><tr className="bg-[#0d2035]/40"><th>Αρχείο</th><th className="hidden sm:table-cell">Ημερομηνία</th><th>Ενέργειες</th></tr></thead>
                 <tbody>
@@ -580,7 +602,7 @@ export default function CaseDetailPage() {
                           <span className="text-sm text-[#d4dce8] truncate max-w-[200px]">{d.filename || d.name}</span>
                         </div>
                       </td>
-                      <td className="hidden sm:table-cell text-xs">{d.uploaded_at ? new Date(d.uploaded_at).toLocaleDateString('el-GR') : '—'}</td>
+                      <td className="hidden sm:table-cell text-xs">{d.uploaded_at ? parseTs(d.uploaded_at).toLocaleDateString('el-GR') : '—'}</td>
                       <td>
                         <button className="p-1.5 rounded hover:bg-[#132B45] text-[#7a9ab8] hover:text-[#C6A75E]"><Download size={13} /></button>
                       </td>
@@ -605,7 +627,7 @@ export default function CaseDetailPage() {
                   <p className="text-xs text-[#5a7a9a] mt-1.5">
                     {n.author_name && <span className="font-medium text-[#7a9ab8]">{n.author_name}</span>}
                     {n.author_name && ' — '}
-                    {n.created_at ? new Date(n.created_at).toLocaleString('el-GR') : ''}
+                    {n.created_at ? parseTs(n.created_at).toLocaleString('el-GR') : ''}
                   </p>
                 </div>
               ))}

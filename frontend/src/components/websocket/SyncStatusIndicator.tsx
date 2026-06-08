@@ -3,7 +3,7 @@
  * Φάση 1.7: Real-time Messaging
  */
 
-import { Check, Cloud, CloudX, WifiOff } from 'lucide-react';
+import { Check, Cloud, CloudOff, WifiOff } from 'lucide-react';
 import { useWebSocketContext } from '@/contexts/WebSocketContext';
 import { useEffect, useState } from 'react';
 

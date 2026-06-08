@@ -55,6 +55,12 @@ services:
       SMTP_FROM: ${SMTP_FROM:-}
       SMTP_FROM_NAME: ${SMTP_FROM_NAME:-Nomos One}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      BASE_URL: ${BASE_URL:-https://nomos.skotanislaw.gr}
+      INTAKE_IMAP_HOST: ${INTAKE_IMAP_HOST:-}
+      INTAKE_IMAP_PORT: ${INTAKE_IMAP_PORT:-993}
+      INTAKE_IMAP_USER: ${INTAKE_IMAP_USER:-}
+      INTAKE_IMAP_PASS: ${INTAKE_IMAP_PASS:-}
     volumes:
       - document_data:/data/documents
     networks:

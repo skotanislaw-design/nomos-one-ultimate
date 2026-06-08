@@ -63,18 +63,13 @@ export default function ClientsPage() {
   };
   useEffect(load, []);
 
-  // Load cases when a client is selected
+  // Load cases when a client is selected — uses bidirectional endpoint
   useEffect(() => {
     if (!selectedClient) { setClientCases([]); return; }
+    const cid = selectedClient._id || selectedClient.id;
     setLoadingDetail(true);
-    casesApi.list()
-      .then(r => {
-        const all = Array.isArray(r.data) ? r.data : [];
-        const cid = selectedClient._id || selectedClient.id;
-        setClientCases(all.filter((c: any) =>
-          c.client_id === cid || c.client_name === selectedClient.full_name
-        ));
-      })
+    clientsApi.getCases(cid)
+      .then(r => setClientCases(Array.isArray(r.data) ? r.data : []))
       .catch(() => setClientCases([]))
       .finally(() => setLoadingDetail(false));
   }, [selectedClient]);
@@ -186,7 +181,7 @@ export default function ClientsPage() {
         </div>
       </div>
 
-      <div className="glass-card overflow-hidden">
+      <div className="glass-card overflow-hidden table-scroll">
         <table className="w-full table-premium">
           <thead>
             <tr className="bg-[#0d2035]/40">
@@ -211,7 +206,17 @@ export default function ClientsPage() {
                           ? <Building2 size={12} className="text-[#C6A75E]" />
                           : <UserIcon size={12} className="text-[#7a9ab8]" />}
                       </div>
-                      <span className="font-medium text-[#d4dce8]">{c.full_name}</span>
+                      <div>
+                        <button onClick={() => nav(`/clients/${c._id || c.id}`)}
+                          className="font-medium text-[#d4dce8] hover:text-[#C6A75E] transition-colors text-left cursor-pointer">
+                          {c.full_name}
+                        </button>
+                        {c.cases_count > 0 && (
+                          <span className="ml-2 text-[10px] font-mono text-[#C6A75E] bg-[#C6A75E]/10 border border-[#C6A75E]/20 px-1.5 py-0.5 rounded">
+                            {c.cases_count} υπόθ.
+                          </span>
+                        )}
+                      </div>
                     </div>
                   </td>
                   <td className="hidden sm:table-cell text-xs font-mono">{c.afm || '—'}</td>
@@ -224,7 +229,7 @@ export default function ClientsPage() {
                   </td>
                   <td>
                     <div className="flex items-center gap-1">
-                      <button onClick={() => openDetail(c)} title="Προβολή"
+                      <button onClick={() => nav(`/clients/${c._id || c.id}`)} title="360° Προβολή"
                         className="p-1.5 rounded hover:bg-[#132B45] text-[#7a9ab8] hover:text-[#C6A75E] transition-all">
                         <Eye size={14} />
                       </button>
@@ -377,19 +382,22 @@ export default function ClientsPage() {
                       <p className="text-sm text-[#4a6a8a] text-center py-4">Δεν βρέθηκαν υποθέσεις</p>
                     ) : (
                       <div className="space-y-1.5">
-                        {clientCases.slice(0, 5).map((c: any) => (
+                        {clientCases.map((c: any) => (
                           <button key={c._id || c.id} onClick={() => { setSelectedClient(null); nav(`/cases/${c._id || c.id}`); }}
                             className="w-full flex items-center gap-3 p-3 rounded-xl bg-[#0d2035]/40 border border-[#1a3a5c]/20 hover:border-[#C6A75E]/30 hover:bg-[#132B45]/60 transition-all text-left group">
                             <div className="flex-1 min-w-0">
-                              <p className="text-xs font-medium text-[#d4dce8] truncate group-hover:text-[#C6A75E] transition-colors">{c.title}</p>
-                              <p className="text-[10px] text-[#5a7a9a]">{c.category || ''} {c.case_number ? `· ${c.case_number}` : ''}</p>
+                              <p className="text-xs font-medium text-[#d4dce8] truncate group-hover:text-[#C6A75E] transition-colors">
+                                {c.offense || c.title || '—'}
+                              </p>
+                              <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                                {c.legal_category && <span className="text-[9px] text-[#5a7a9a] bg-[#0d2035] border border-[#1a3a5c]/30 px-1 py-0.5 rounded">{c.legal_category}</span>}
+                                {c.law_articles && <span className="text-[9px] font-mono text-[#C6A75E]/70">{c.law_articles}</span>}
+                                {c.case_number && <span className="text-[9px] font-mono text-[#5a7a9a]">{c.case_number}</span>}
+                              </div>
                             </div>
                             <ChevronRight size={13} className="text-[#3a5a7a] group-hover:text-[#C6A75E] transition-colors flex-shrink-0" />
                           </button>
                         ))}
-                        {clientCases.length > 5 && (
-                          <p className="text-xs text-[#4a6a8a] text-center pt-1">+ {clientCases.length - 5} ακόμα</p>
-                        )}
                       </div>
                     )}
                   </div>

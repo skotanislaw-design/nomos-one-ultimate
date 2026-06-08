@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Plus, X, Shield, Trash2, CheckCircle, XCircle, AlertCircle, Loader2 } from 'lucide-react';
 import { usersApi } from '@/lib/api';
+import { parseTs } from '@/lib/prefs';
 import { usePermissions } from '@/hooks/usePermissions';
 import { toast } from 'sonner';
 
@@ -129,7 +130,7 @@ export default function UsersPage() {
           PENDING USERS SECTION
       ═══════════════════════════════════════════════════════════════ */}
       {pendingUsers.length > 0 && (
-        <div className="glass-card overflow-hidden border border-amber-500/20">
+        <div className="glass-card overflow-hidden table-scroll border border-amber-500/20">
           <div className="p-5 border-b border-amber-500/20 bg-amber-500/5">
             <div className="flex items-center gap-2">
               <AlertCircle size={18} className="text-amber-400" />
@@ -155,7 +156,7 @@ export default function UsersPage() {
                   <td className="font-medium text-[#d4dce8]">{u.name}</td>
                   <td className="text-xs text-[#8aa0b8]">{u.email}</td>
                   <td className="hidden sm:table-cell text-xs text-[#5a7a9a]">
-                    {u.created_at ? new Date(u.created_at).toLocaleDateString('el-GR') : '—'}
+                    {u.created_at ? parseTs(u.created_at).toLocaleDateString('el-GR') : '—'}
                   </td>
                   <td>
                     <div className="flex items-center gap-2">
@@ -191,7 +192,7 @@ export default function UsersPage() {
       {/* ═══════════════════════════════════════════════════════════════
           ACTIVE USERS
       ═══════════════════════════════════════════════════════════════ */}
-      <div className="glass-card overflow-hidden">
+      <div className="glass-card overflow-hidden table-scroll">
         <div className="p-5 border-b border-[#1a3a5c]/40">
           <h3 className="section-title">Ενεργοί Χρήστες</h3>
         </div>

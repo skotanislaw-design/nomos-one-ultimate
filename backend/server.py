@@ -3,7 +3,7 @@ Nomos One - Law Firm Management System
 Production-ready FastAPI backend — Phase 1 Security Hardened
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Query, Request
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -44,6 +44,10 @@ from websocket_service import get_websocket_manager
 from websocket_routes import router as ws_router, set_jwt_secret
 from telegram_intake_service import router as telegram_router, register_webhook, SESSION_TTL_HOURS
 from email_intake_service import email_intake_loop
+from pinakia_service import extract_pinakio, match_hearings as match_pinakio_hearings
+from lexis_service import SPECIALISTS, route_question
+from nomologia_service import retrieve_relevant_nomologia
+from solon_service import search_solon, format_solon_for_prompt
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -74,6 +78,8 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # Model routing: Haiku for bulk extraction (cheap), Sonnet for legal reasoning & chat (quality)
 MODEL_EXTRACTION = "claude-haiku-4-5-20251001"
 MODEL_CHAT = "claude-sonnet-4-6"
+# API key for server-to-server intake calls (Google Apps Script, etc.)
+INTAKE_API_KEY = os.getenv("INTAKE_API_KEY", "")
 
 # Validate JWT_SECRET at startup
 if not JWT_SECRET or JWT_SECRET.startswith("CHANGE"):
@@ -186,6 +192,19 @@ async def startup():
     await db.expenses_log.create_index([("case_id", 1)])
     await db.invoices.create_index([("case_id", 1)])
     await db.expenses_log.create_index([("case_id", 1)])
+    # Pinakia (court schedules)
+    await db.pinakia.create_index([("hearing_date", -1)])
+    await db.pinakia.create_index([("court_name", 1)])
+    # ── Criminal Cases Module ──
+    await db.cc_cases.create_index([("id", 1)], unique=True)
+    await db.cc_cases.create_index([("created_at", -1)])
+    await db.cc_parties.create_index([("case_id", 1)])
+    await db.cc_events.create_index([("case_id", 1), ("event_date", 1)])
+    await db.cc_documents.create_index([("case_id", 1)])
+    await db.cc_evidence.create_index([("case_id", 1)])
+    await db.cc_issues.create_index([("case_id", 1)])
+    await db.cc_tasks.create_index([("case_id", 1)])
+    await db.cc_outputs.create_index([("case_id", 1), ("created_at", -1)])
     # Initialize atomic counter
     existing = await db.counters.find_one({"_id": "case_number"})
     if not existing:
@@ -223,9 +242,25 @@ async def startup():
         [("updated_at", 1)], expireAfterSeconds=SESSION_TTL_HOURS * 3600
     )
     await db.pending_intakes.create_index([("submitted_at", -1)])
+
+    # ── Portal access logs: indexes + 7-year TTL retention ───────────────────
+    PORTAL_LOG_TTL_SECONDS = 7 * 365 * 24 * 3600  # 7 years
+    await db.portal_access_logs.create_index([("case_id", 1), ("timestamp", -1)])
+    await db.portal_access_logs.create_index([("code_hash", 1)])
+    await db.portal_access_logs.create_index([("timestamp", -1)], expireAfterSeconds=PORTAL_LOG_TTL_SECONDS)
     base_url = os.getenv("BASE_URL", "https://nomos.skotanislaw.gr")
     await register_webhook(base_url)
     asyncio.create_task(email_intake_loop(db, ANTHROPIC_API_KEY, MODEL_EXTRACTION))
+
+    # Pre-warm Solon browser in background so first LEXIS query is fast
+    async def _prewarm_solon():
+        try:
+            from solon_service import _ensure_browser
+            await _ensure_browser()
+            logger.info("Solon browser pre-warmed")
+        except Exception as e:
+            logger.warning(f"Solon pre-warm failed: {e}")
+    asyncio.create_task(_prewarm_solon())
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -308,6 +343,88 @@ async def get_client_name(client_id):
         c = await db.clients.find_one({"_id": make_id(client_id)}, {"name": 1})
         return c["name"] if c else "Άγνωστος"
     except: return "Άγνωστος"
+
+async def _check_payment_gate(case_id: str, action_label: str):
+    """Block any legal action if the case has an outstanding balance. Notify secretariat + handler."""
+    if not case_id:
+        return
+    case = await db.cases.find_one({"_id": make_id(case_id)}, {"title": 1, "case_number": 1, "assigned_lawyer_id": 1, "client_id": 1})
+    if not case:
+        return
+    invoices = await db.invoices.find({"case_id": case_id}).to_list(None)
+    total_invoiced = sum(float(i.get("total_payable", i.get("total", 0))) for i in invoices)
+    total_paid = sum(float(i.get("amount_paid", 0)) for i in invoices)
+    outstanding = round(total_invoiced - total_paid, 2)
+    if outstanding <= 0:
+        return
+
+    case_title = case.get("title", "—")
+    case_number = case.get("case_number", "—")
+
+    # Collect recipients: all secretariat/admin + case handler
+    recipients = await db.users.find(
+        {"role": {"$in": [UserRole.SECRETARY.value, UserRole.ADMIN.value]}, "is_active": True},
+        {"_id": 1, "name": 1}
+    ).to_list(None)
+    lawyer_id = case.get("assigned_lawyer_id")
+    if lawyer_id:
+        lawyer = await db.users.find_one({"_id": make_id(lawyer_id)}, {"_id": 1, "name": 1})
+        if lawyer and not any(str(r["_id"]) == str(lawyer["_id"]) for r in recipients):
+            recipients.append(lawyer)
+
+    # Store in-app notifications
+    for r in recipients:
+        await db.notifications.insert_one({
+            "user_id": str(r["_id"]),
+            "type": "payment_required",
+            "title": "⚠️ Απαιτείται εξόφληση αμοιβής",
+            "message": (
+                f"Η ενέργεια '{action_label}' στην υπόθεση «{case_title}» (#{case_number}) "
+                f"δεν επιτράπηκε. Εκκρεμεί υπόλοιπο αμοιβής: {outstanding:,.2f}€. "
+                f"Ουδεμία ενέργεια επιτρέπεται πριν εξοφληθεί η αμοιβή στο σύνολό της."
+            ),
+            "case_id": case_id,
+            "outstanding_balance": outstanding,
+            "created_at": datetime.utcnow(),
+            "read": False,
+        })
+
+    # Telegram alert to all authorized chats
+    try:
+        import httpx as _httpx_gate
+        bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        allowed_raw = os.getenv("TELEGRAM_ALLOWED_CHATS", "")
+        if bot_token and allowed_raw.strip():
+            chat_ids = [int(x.strip()) for x in allowed_raw.split(",") if x.strip().lstrip("-").isdigit()]
+            text = (
+                f"🚫 *Αποκλεισμός ενέργειας — Εκκρεμής Αμοιβή*\n\n"
+                f"Υπόθεση: *{case_title}* (#{case_number})\n"
+                f"Ενέργεια: {action_label}\n"
+                f"Εκκρεμές υπόλοιπο: *{outstanding:,.2f}€*\n\n"
+                f"_Ουδεμία ενέργεια επιτρέπεται πριν εξοφληθεί η αμοιβή στο σύνολό της._"
+            )
+            api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            async with _httpx_gate.AsyncClient(timeout=8) as client:
+                for chat_id in chat_ids:
+                    try:
+                        await client.post(api_url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+                    except Exception:
+                        pass
+    except Exception as tg_err:
+        logger.warning(f"Payment gate Telegram notify failed: {tg_err}")
+
+    raise HTTPException(
+        status_code=402,
+        detail={
+            "code": "PAYMENT_REQUIRED",
+            "message": (
+                f"Εκκρεμεί αμοιβή {outstanding:,.2f}€ στην υπόθεση «{case_title}». "
+                f"Ουδεμία ενέργεια επιτρέπεται πριν εξοφληθεί η αμοιβή στο σύνολό της."
+            ),
+            "outstanding_balance": outstanding,
+            "case_id": case_id,
+        }
+    )
 
 # ── Seed ──────────────────────────────────────────────────────────────────────
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "christos@skotanislaw.com")
@@ -622,10 +739,13 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 # ── Client Portal Models ──
+PORTAL_CODE_TTL_DAYS = int(os.getenv("PORTAL_CODE_TTL_DAYS", "90"))
+
 class PortalLoginRequest(BaseModel):
     name: str
     case_category: str
     portal_code: str
+    source: Optional[str] = None
 
 class PortalForgotPasswordRequest(BaseModel):
     name: str
@@ -638,8 +758,9 @@ class PortalMessageRequest(BaseModel):
 class PortalAccessRequest(BaseModel):
     permissions: List[str] = Field(default_factory=lambda: [
         'case_title', 'case_number', 'case_status', 'client_name',
-        'lawyer_name', 'lawyer_email', 'total_fees', 'outstanding_balance'
+        'lawyer_name', 'lawyer_email', 'lawyer_phone', 'total_fees', 'outstanding_balance'
     ])
+    case_id: Optional[str] = None
 
 @app.post("/api/auth/login")
 async def login(req: LoginRequest, request: Request):
@@ -1006,6 +1127,163 @@ async def bot_chat(req: BotChatRequest, user=Depends(get_current_user)):
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
+@app.post("/api/linda/chat")
+async def linda_chat(req: BotChatRequest, user=Depends(get_current_user)):
+    """Linda — Personal AI assistant for the lawyer."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "Η υπηρεσία AI δεν έχει ρυθμιστεί")
+
+    # Collect brief stats for context
+    try:
+        active_cases   = await db.cases.count_documents({"status": "active"})
+        pending_cases  = await db.cases.count_documents({"status": "pending"})
+        total_clients  = await db.clients.count_documents({})
+        pending_docs   = await db.documents.count_documents({"uploaded_by": "portal_client", "status": "pending_review"})
+        today_str      = datetime.utcnow().strftime("%d/%m/%Y")
+    except Exception:
+        active_cases = pending_cases = total_clients = pending_docs = 0
+        today_str = datetime.utcnow().strftime("%d/%m/%Y")
+
+    system_prompt = (
+        f"Σήμερα είναι {today_str}. "
+        "Λέγεσαι Λίντα. Είσαι η έξυπνη, αποτελεσματική και εξαιρετικά οργανωμένη "
+        "προσωπική νομική βοηθός του δικηγόρου Χρήστου Σκοτάνη, Δικηγόρου Μυκόνου. "
+        "Έχεις ζεστό, επαγγελματικό τόνο — σαν έμπιστη συνεργάτιδα που ξέρει την υπόθεση από μέσα. "
+        "Μιλάς ΠΑΝΤΑ ελληνικά εκτός αν ο χρήστης γράψει σε άλλη γλώσσα. "
+        "\n\nΤρέχουσα κατάσταση γραφείου:\n"
+        f"• Ενεργές υποθέσεις: {active_cases}\n"
+        f"• Σε εκκρεμότητα: {pending_cases}\n"
+        f"• Εντολείς: {total_clients}\n"
+        f"• Έγγραφα portal προς έλεγχο: {pending_docs}\n"
+        "\nΜπορείς να βοηθήσεις με:\n"
+        "– Οργάνωση ημερήσιας ατζέντας και προτεραιοτήτων\n"
+        "– Σύνταξη νομικών εγγράφων, επιστολών, υπομνημάτων\n"
+        "– Ανάλυση νομικών ζητημάτων με αναφορά στην ελληνική νομοθεσία\n"
+        "– Εντοπισμό επικείμενων προθεσμιών και δικασίμων\n"
+        "– Σύνοψη υποθέσεων για τρίτους\n"
+        "– Οποιαδήποτε άλλη υποστήριξη χρειάζεται ο Χρήστος"
+    )
+
+    messages = [
+        {"role": h.role, "content": h.content}
+        for h in req.history[-20:]
+        if h.role in ("user", "assistant") and h.content.strip()
+    ]
+    messages.append({"role": "user", "content": req.message})
+
+    async def stream_response():
+        import anthropic as ant
+        client = ant.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        try:
+            async with client.messages.stream(
+                model=MODEL_CHAT,
+                max_tokens=2048,
+                system=system_prompt,
+                messages=messages,
+            ) as stream:
+                async for text in stream.text_stream:
+                    yield f"data: {json.dumps({'text': text})}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.error(f"Linda chat error: {e}")
+            yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
+
+    return StreamingResponse(
+        stream_response(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+# ── LEXIS — 12 Specialist Legal AI ──────────────────────────────────────────
+
+class LexisRequest(BaseModel):
+    message: str
+    history: list = []
+    specialist_id: str = ""   # empty = auto-route
+
+@app.get("/api/lexis/specialists")
+async def lexis_specialists(user=Depends(get_current_user)):
+    return [{"id": s["id"], "name": s["name"], "short": s["short"],
+             "color": s["color"], "icon": s["icon"]} for s in SPECIALISTS.values()]
+
+@app.post("/api/lexis/chat")
+async def lexis_chat(req: LexisRequest, user=Depends(get_current_user)):
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "Η υπηρεσία AI δεν έχει ρυθμιστεί")
+
+    sid = req.specialist_id if req.specialist_id else route_question(req.message)
+    spec = SPECIALISTS.get(sid, SPECIALISTS["civil"])
+
+    messages = [{"role": h["role"], "content": h["content"]}
+                for h in req.history[-20:]
+                if h.get("role") in ("user", "assistant") and h.get("content", "").strip()]
+    messages.append({"role": "user", "content": req.message})
+
+    async def stream_response():
+        import anthropic as ant
+        client = ant.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        yield f"data: {json.dumps({'specialist_id': sid, 'specialist_name': spec['name']})}\n\n"
+        try:
+            # Fetch live νομολογία — HUDOC/EUR-Lex + Solon concurrently
+            yield f"data: {json.dumps({'status': 'Αναζήτηση νομολογίας...'})}\n\n"
+            try:
+                nomologia_ctx, solon_results = await asyncio.wait_for(
+                    asyncio.gather(
+                        retrieve_relevant_nomologia(req.message, sid),
+                        search_solon(req.message, sid, max_results=4),
+                        return_exceptions=True,
+                    ),
+                    timeout=12.0
+                )
+            except asyncio.TimeoutError:
+                nomologia_ctx, solon_results = "", []
+                logger.warning("nomologia retrieval timed out")
+
+            if isinstance(nomologia_ctx, Exception):
+                nomologia_ctx = ""
+            if isinstance(solon_results, Exception):
+                solon_results = []
+
+            system = spec["system_prompt"]
+            if nomologia_ctx:
+                system = system + "\n\n" + nomologia_ctx
+            if solon_results:
+                solon_ctx = await format_solon_for_prompt(solon_results)
+                if solon_ctx:
+                    system = system + "\n\n" + solon_ctx
+
+            async with client.messages.stream(
+                model=MODEL_CHAT,
+                max_tokens=2048,
+                system=system,
+                messages=messages,
+            ) as stream:
+                async for text in stream.text_stream:
+                    yield f"data: {json.dumps({'text': text})}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.error(f"Lexis chat error: {e}")
+            yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
+
+    return StreamingResponse(stream_response(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/lexis/search-nomologia")
+async def lexis_search_nomologia(q: str, specialist: str = "echr", user=Depends(get_current_user)):
+    """Direct νομολογία search — returns raw results list."""
+    from nomologia_service import _search_hudoc, _search_eurlex
+    hudoc, eurlex = await asyncio.gather(
+        _search_hudoc(q, specialist, max_results=5),
+        _search_eurlex(q, specialist, max_results=3),
+        return_exceptions=True,
+    )
+    return {
+        "echr": hudoc if not isinstance(hudoc, Exception) else [],
+        "eurlex": eurlex if not isinstance(eurlex, Exception) else [],
+    }
+
+
 @app.post("/api/auth/change-password")
 async def change_password(req: ChangePasswordRequest, user=Depends(get_current_user)):
     full_user = await db.users.find_one({"_id": make_id(user["id"])})
@@ -1067,6 +1345,38 @@ async def create_user(req: CreateUserRequest, user=Depends(require_role(UserRole
     await audit("CREATE_USER", user["id"], "user", str(result.inserted_id))
     doc["_id"] = result.inserted_id
     s = serialize(doc); s.pop("password", None); return s
+
+# ── Self-update profile (any logged-in user) — MUST be before /{user_id} ──
+class UpdateProfileRequest(BaseModel):
+    full_name: Optional[str] = None
+    phone:     Optional[str] = None
+    email:     Optional[str] = None
+
+@app.put("/api/users/me")
+async def update_my_profile(req: UpdateProfileRequest, user=Depends(get_current_user)):
+    """Any user can update their own name, phone, email."""
+    update: dict = {"updated_at": datetime.utcnow()}
+    if req.full_name and req.full_name.strip():
+        update["full_name"] = sanitize_string(req.full_name.strip())
+        update["name"]      = update["full_name"]
+    if req.phone is not None:
+        update["phone"] = sanitize_string(req.phone.strip())
+    if req.email and req.email.strip():
+        email = req.email.strip().lower()
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+            raise HTTPException(400, "Μη έγκυρη μορφή email")
+        if await db.users.find_one({"email": email, "_id": {"$ne": make_id(user["id"])}}):
+            raise HTTPException(409, "Το email χρησιμοποιείται ήδη")
+        update["email"] = email
+    await db.users.update_one({"_id": make_id(user["id"])}, {"$set": update})
+    await audit("UPDATE_PROFILE", user["id"], "user", user["id"])
+    updated = await db.users.find_one({"_id": make_id(user["id"])})
+    return {
+        "ok":    True,
+        "name":  updated.get("full_name") or updated.get("name", ""),
+        "email": updated.get("email", ""),
+        "phone": updated.get("phone", ""),
+    }
 
 @app.put("/api/users/{user_id}")
 async def update_user(user_id: str, req: UpdateUserRequest, user=Depends(require_role(UserRole.ADMIN))):
@@ -1170,35 +1480,193 @@ async def get_portal_user(credentials: HTTPAuthorizationCredentials = Depends(HT
         raise HTTPException(401, "Μη έγκυρο token")
 
 @app.post("/api/portal/auth")
-async def portal_login(req: PortalLoginRequest):
-    """Client portal authentication with name, category, and code"""
-    # Find case by client name, category, and portal code
+async def portal_login(req: PortalLoginRequest, request: Request):
+    """Client portal authentication with name and code"""
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
+
     portal_access = await db.portal_access.find_one({
-        "portal_code": req.portal_code.strip(),
+        "portal_code": {"$regex": f"^{re.escape(req.portal_code.strip())}$", "$options": "i"},
         "is_active": True
     })
     if not portal_access:
         raise HTTPException(401, "Μη έγκυρος κωδικός πρόσβασης")
 
-    case = await db.cases.find_one({"_id": ObjectId(portal_access["case_id"])})
-    if not case or case.get("client_name", "").lower() != req.name.strip().lower():
+    # Check TTL expiry
+    expires_at = portal_access.get("expires_at")
+    if expires_at and datetime.utcnow() > expires_at:
+        raise HTTPException(401, "Ο κωδικός πρόσβασης έχει λήξει. Επικοινωνήστε με το γραφείο.")
+
+    # Compare name against stored client_name (set when generating access)
+    stored_name = (portal_access.get("client_name") or "").strip().lower()
+    submitted_name = req.name.strip().lower()
+    if stored_name and stored_name != submitted_name:
         raise HTTPException(401, "Μη συμφωνία στοιχείων")
 
-    # Update last accessed
+    case = await db.cases.find_one({"_id": ObjectId(portal_access["case_id"])})
+
+    now = datetime.utcnow()
     await db.portal_access.update_one(
         {"_id": portal_access["_id"]},
-        {"$set": {"accessed_at": datetime.utcnow()}}
+        {"$set": {"accessed_at": now, "last_ip": client_ip, "last_user_agent": user_agent[:200]}}
     )
 
+    # Full audit trail
+    import hashlib
+    code_hash = hashlib.sha256(req.portal_code.strip().encode()).hexdigest()
+    await db.portal_access_logs.insert_one({
+        "portal_access_id": str(portal_access["_id"]),
+        "code_hash": code_hash,
+        "case_id": portal_access["case_id"],
+        "client_id": str(portal_access["client_id"]),
+        "client_name": req.name,
+        "ip": client_ip,
+        "user_agent": user_agent[:300],
+        "source": req.source or "direct",
+        "timestamp": now,
+    })
+
+    client_name = portal_access.get("client_name") or req.name
     token = create_portal_token({
         "client_id": portal_access["client_id"],
         "case_id": portal_access["case_id"],
-        "client_name": case.get("client_name"),
+        "client_name": client_name,
         "permissions": portal_access.get("permissions", [])
     })
 
-    await audit("PORTAL_LOGIN", str(portal_access["client_id"]), "portal", portal_access["case_id"])
-    return {"token": token, "client_name": case.get("client_name"), "case_title": case.get("title")}
+    await audit("PORTAL_LOGIN", str(portal_access["client_id"]), "portal", portal_access["case_id"],
+                details={"ip": client_ip, "source": req.source or "direct", "code_hash": code_hash})
+    return {
+        "token": token,
+        "client_name": client_name,
+        "case_title": case.get("title") if case else "",
+        "mandate_accepted": portal_access.get("mandate_accepted", False),
+    }
+
+@app.post("/api/portal/accept-mandate")
+async def portal_accept_mandate(request: Request, user=Depends(get_portal_user)):
+    """Record client acceptance of the mandate (εντολή) on first portal login."""
+    client_ip = request.client.host if request.client else "unknown"
+    accepted_at = datetime.utcnow()
+
+    # Find portal access record
+    portal_access = await db.portal_access.find_one({
+        "case_id": user["case_id"],
+        "client_id": user["client_id"],
+        "is_active": True,
+    })
+    if not portal_access:
+        raise HTTPException(404, "Portal access not found")
+    if portal_access.get("mandate_accepted"):
+        return {"ok": True, "already_accepted": True}
+
+    # Get case info for the email
+    case = await db.cases.find_one({"_id": ObjectId(user["case_id"])})
+    case_title    = (case or {}).get("title") or (case or {}).get("offense") or "—"
+    case_category = (case or {}).get("category") or (case or {}).get("legal_category") or "—"
+    case_subject  = (case or {}).get("description") or (case or {}).get("offense") or "—"
+    client_name   = user.get("client_name") or portal_access.get("client_name", "—")
+    client_email  = portal_access.get("client_email", "")
+
+    # Persist acceptance
+    await db.portal_access.update_one(
+        {"_id": portal_access["_id"]},
+        {"$set": {
+            "mandate_accepted": True,
+            "mandate_accepted_at": accepted_at,
+            "mandate_ip": client_ip,
+        }}
+    )
+    await audit("PORTAL_MANDATE_ACCEPT", user["client_id"], "portal", user["case_id"],
+                {"ip": client_ip, "client_name": client_name})
+
+    # Send confirmation email to client
+    if client_email:
+        try:
+            settings_doc = await db.settings.find_one({"_id": "global"}) or {}
+            smtp_host = settings_doc.get("smtp_host") or os.getenv("SMTP_HOST", "")
+            smtp_port = int(settings_doc.get("smtp_port") or os.getenv("SMTP_PORT", "587"))
+            smtp_user = settings_doc.get("smtp_user") or os.getenv("SMTP_USER", "")
+            smtp_pass = settings_doc.get("smtp_pass") or os.getenv("SMTP_PASS", "")
+            from_email = settings_doc.get("notification_email") or smtp_user or FIRM_EMAIL_DISPLAY
+            noreply_addr = os.getenv("SMTP_FROM", from_email)
+            ts_str = accepted_at.strftime("%d/%m/%Y %H:%M") + " UTC"
+
+            mandate_html = f"""
+<!DOCTYPE html><html lang="el">
+<head><meta charset="UTF-8">
+<style>
+  body{{font-family:'Segoe UI',Arial,sans-serif;background:#f4f6f9;margin:0;padding:0}}
+  .wrap{{max-width:640px;margin:32px auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 16px rgba(0,0,0,.1)}}
+  .hdr{{background:linear-gradient(135deg,#071220,#0a1929);padding:32px 40px;text-align:center}}
+  .hdr h1{{color:#C6A75E;font-size:22px;margin:0 0 6px}}
+  .hdr p{{color:#8aa0b8;font-size:13px;margin:0}}
+  .body{{padding:36px 40px}}
+  .body p{{color:#374151;font-size:14px;line-height:1.7;margin:0 0 14px}}
+  .mandate-box{{background:#f8fafc;border:1px solid #e2e8f0;border-left:4px solid #C6A75E;border-radius:8px;padding:20px 24px;margin:20px 0}}
+  .mandate-box p{{margin:0 0 10px;font-size:13px;color:#374151}}
+  .mandate-box p:last-child{{margin:0}}
+  .info-row{{display:flex;gap:8px;margin:6px 0}}
+  .info-label{{font-weight:600;color:#6b7280;font-size:12px;min-width:130px}}
+  .info-val{{color:#111827;font-size:13px}}
+  .stamp{{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:14px 20px;margin:20px 0;text-align:center}}
+  .stamp p{{color:#166534;font-size:13px;font-weight:600;margin:0}}
+  .footer{{background:#f8fafc;border-top:1px solid #e5e7eb;padding:20px 40px;text-align:center}}
+  .footer p{{color:#9ca3af;font-size:11px;margin:0}}
+</style></head>
+<body><div class="wrap">
+  <div class="hdr">
+    <h1>Σκοτάνης &amp; Συνεργάτες</h1>
+    <p>Επιβεβαίωση Εντολής &amp; Αποδοχής Αμοιβής</p>
+  </div>
+  <div class="body">
+    <p>Αγαπητέ/ή <strong>{client_name}</strong>,</p>
+    <p>Σας αποστέλλουμε επιβεβαίωση της ψηφιακής αποδοχής της εντολής που χορηγήσατε στο δικηγορικό μας γραφείο μέσω της ηλεκτρονικής πλατφόρμας Client Portal.</p>
+
+    <div class="mandate-box">
+      <p><strong>ΣΤΟΙΧΕΙΑ ΕΝΤΟΛΗΣ</strong></p>
+      <div class="info-row"><span class="info-label">Εντολέας:</span><span class="info-val">{client_name}</span></div>
+      <div class="info-row"><span class="info-label">Τίτλος Υπόθεσης:</span><span class="info-val">{case_title}</span></div>
+      <div class="info-row"><span class="info-label">Κατηγορία:</span><span class="info-val">{case_category}</span></div>
+      <div class="info-row"><span class="info-label">Αντικείμενο:</span><span class="info-val">{case_subject}</span></div>
+      <div class="info-row"><span class="info-label">Ημ/νία Αποδοχής:</span><span class="info-val">{ts_str}</span></div>
+      <div class="info-row"><span class="info-label">Διεύθυνση IP:</span><span class="info-val">{client_ip}</span></div>
+    </div>
+
+    <p>Με την αποδοχή σας επιβεβαιώνετε ότι:</p>
+    <ul style="color:#374151;font-size:14px;line-height:1.8;padding-left:20px">
+      <li>Εντέλλεσθε το δικηγορικό γραφείο <strong>Σκοτάνης &amp; Συνεργάτες</strong> να αναλάβει και να χειριστεί την ανωτέρω υπόθεσή σας.</li>
+      <li>Αποδέχεστε και δεσμεύεστε να καταβάλετε τη <strong>συμφωνηθείσα αμοιβή</strong> του γραφείου.</li>
+      <li>Αναγνωρίζετε ότι τυχόν δικαστικά έξοδα, γραμμάτια προκαταβολής εισφορών και λοιπές δαπάνες υπόθεσης <strong>βαρύνουν εσάς</strong> ως εντολέα.</li>
+    </ul>
+
+    <div class="stamp">
+      <p>✓ Η εντολή αποδέχθηκε ψηφιακά — {ts_str}</p>
+    </div>
+
+    <p style="font-size:12px;color:#6b7280">Το παρόν αποτελεί απόδειξη ψηφιακής αποδοχής βάσει του ν. 3979/2011 και του Κανονισμού EU 910/2014 (eIDAS). Φυλάξτε το για τα αρχεία σας.</p>
+  </div>
+  <div class="footer">
+    <p>Σκοτάνης &amp; Συνεργάτες | christos@skotanislaw.com</p>
+  </div>
+</div></body></html>"""
+
+            if smtp_host and smtp_user:
+                import smtplib
+                from email.mime.multipart import MIMEMultipart
+                from email.mime.text import MIMEText as MIMETextLocal
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = "Επιβεβαίωση Εντολής — Σκοτάνης & Συνεργάτες"
+                msg["From"]    = f"Σκοτάνης & Συνεργάτες <{noreply_addr}>"
+                msg["To"]      = f"{client_name} <{client_email}>"
+                msg.attach(MIMETextLocal(mandate_html, "html", "utf-8"))
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as srv:
+                    srv.ehlo(); srv.starttls(); srv.login(smtp_user, smtp_pass)
+                    srv.sendmail(noreply_addr, client_email, msg.as_string())
+        except Exception as e:
+            logger.warning(f"Mandate email failed: {e}")
+
+    return {"ok": True, "accepted_at": accepted_at.isoformat()}
 
 @app.post("/api/portal/forgot-password")
 async def portal_forgot_password(req: PortalForgotPasswordRequest):
@@ -1231,40 +1699,60 @@ async def portal_forgot_password(req: PortalForgotPasswordRequest):
 
 @app.get("/api/portal/my-case")
 async def portal_get_case(user=Depends(get_portal_user)):
-    """Get case data visible to client"""
+    """Get case data visible to client (permission-filtered)"""
     try:
         case = await db.cases.find_one({"_id": ObjectId(user["case_id"])})
     except InvalidId:
         raise HTTPException(404, "Υπόθεση δεν βρέθηκε")
-
     if not case:
         raise HTTPException(404, "Υπόθεση δεν βρέθηκε")
 
     permissions = user.get("permissions", [])
 
-    # Filter case data by permissions
-    filtered_case = {
+    # Get mandate status from portal_access
+    portal_access_doc = await db.portal_access.find_one({
+        "case_id": user["case_id"], "client_id": user["client_id"], "is_active": True
+    })
+    mandate_accepted = (portal_access_doc or {}).get("mandate_accepted", False)
+
+    filtered_case: dict = {
         "id": str(case["_id"]),
-        "title": case.get("title") if "case_title" in permissions else "—",
-        "case_number": case.get("case_number") if "case_number" in permissions else "—",
-        "status": case.get("status") if "case_status" in permissions else "—",
-        "category": case.get("category") if "case_status" in permissions else "—",
+        "title":            case.get("title", "—")       if "case_title"  in permissions else "—",
+        "case_number":      case.get("case_number", "—") if "case_number" in permissions else "—",
+        "status":           case.get("status", "—")      if "case_status" in permissions else "—",
+        "category":         case.get("legal_category") or case.get("category", "—") if "case_status" in permissions else "—",
+        "next_action":      case.get("next_action", "")  if "case_status" in permissions else None,
+        "mandate_accepted": mandate_accepted,
+        "case_subject":     case.get("description") or case.get("offense") or "—",
     }
 
-    # Add lawyer info if permitted
-    if "lawyer_name" in permissions:
-        lawyer = await db.users.find_one({"_id": ObjectId(case.get("assigned_lawyer_id", ""))})
-        filtered_case["lawyer_name"] = lawyer.get("name") if lawyer else "—"
-        filtered_case["lawyer_email"] = lawyer.get("email") if lawyer and "lawyer_email" in permissions else None
+    # Lawyer info
+    lawyer_obj = None
+    if case.get("assigned_lawyer_id"):
+        try:
+            lawyer_obj = await db.users.find_one({"_id": ObjectId(case["assigned_lawyer_id"])})
+        except Exception:
+            pass
 
-    # Add financial info if permitted
+    if "lawyer_name" in permissions and lawyer_obj:
+        filtered_case["lawyer_name"]  = lawyer_obj.get("full_name") or lawyer_obj.get("name", "—")
+        filtered_case["lawyer_email"] = lawyer_obj.get("email", "") if "lawyer_email" in permissions else None
+        filtered_case["lawyer_phone"] = lawyer_obj.get("phone", "") if "lawyer_phone" in permissions else None
+        # Build nested object for frontend compatibility
+        filtered_case["lawyer"] = {
+            "name":  filtered_case["lawyer_name"],
+            "email": filtered_case.get("lawyer_email"),
+            "phone": filtered_case.get("lawyer_phone"),
+        }
+
+    # Financial summary
     if "total_fees" in permissions or "outstanding_balance" in permissions:
-        financials = await db.financials.find({"case_id": user["case_id"]}).to_list(None)
         invoices = await db.invoices.find({"case_id": user["case_id"]}).to_list(None)
-        total_fees = sum(f.get("amount", 0) for f in financials if f.get("entry_type") == "fee")
-        total_paid = sum(i.get("amount_paid", 0) for i in invoices if i.get("payment_status") == "paid")
-        filtered_case["total_fees"] = total_fees if "total_fees" in permissions else None
-        filtered_case["outstanding_balance"] = (total_fees - total_paid) if "outstanding_balance" in permissions else None
+        total_invoiced = sum(float(i.get("total_payable", i.get("total", 0))) for i in invoices)
+        total_paid     = sum(float(i.get("amount_paid", 0)) for i in invoices)
+        filtered_case["total_fees"]          = round(total_invoiced, 2) if "total_fees" in permissions else None
+        filtered_case["paid_fees"]           = round(total_paid, 2)
+        filtered_case["outstanding_balance"] = round(total_invoiced - total_paid, 2) if "outstanding_balance" in permissions else None
 
     return filtered_case
 
@@ -1312,82 +1800,349 @@ async def portal_send_message(req: PortalMessageRequest, user=Depends(get_portal
 
 @app.post("/api/portal/upload")
 async def portal_upload_document(file: UploadFile = File(...), user=Depends(get_portal_user)):
-    """Client upload document"""
+    """Client stages a document — AI analysis runs only after confirm."""
     if not file.filename:
         raise HTTPException(400, "Δεν υπάρχει αρχείο")
 
-    # Save document
-    doc_id = str(ObjectId())
-    case_id = user["case_id"]
-    doc_dir = Path(f"documents/{case_id}")
+    file_bytes = await file.read()
+    doc_id     = str(ObjectId())
+    case_id    = user["case_id"]
+    doc_dir    = Path(f"documents/{case_id}")
     doc_dir.mkdir(parents=True, exist_ok=True)
-    file_path = doc_dir / f"{doc_id}_{file.filename}"
+    file_path  = doc_dir / f"{doc_id}_{file.filename}"
 
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
+    with open(file_path, "wb") as fh:
+        fh.write(file_bytes)
 
-    # Store in database
     doc = {
-        "case_id": case_id,
-        "filename": file.filename,
-        "file_path": str(file_path),
-        "uploaded_by": "portal_client",
-        "uploaded_by_name": user.get("client_name"),
-        "created_at": datetime.utcnow(),
-        "size": file.size
+        "case_id":          case_id,
+        "filename":         file.filename,
+        "file_path":        str(file_path),
+        "mime_type":        file.content_type or "application/octet-stream",
+        "uploaded_by":      "portal_client",
+        "uploaded_by_name": user.get("client_name", ""),
+        "client_id":        user.get("client_id", ""),
+        "created_at":       datetime.utcnow(),
+        "size":             len(file_bytes),
+        "ai_summary":       "",
+        "status":           "staged",
+    }
+    result = await db.documents.insert_one(doc)
+    doc_id_str = str(result.inserted_id)
+
+    await audit("PORTAL_UPLOAD_STAGE", user.get("client_id", ""), "document", doc_id_str)
+    return {"ok": True, "document_id": doc_id_str, "filename": file.filename}
+
+@app.post("/api/portal/upload-confirm")
+async def portal_upload_confirm(user=Depends(get_portal_user)):
+    """Client confirms batch upload → silent AI analysis → notify lawyer."""
+    case_id = user["case_id"]
+    staged = await db.documents.find({"case_id": case_id, "status": "staged"}).to_list(None)
+    if not staged:
+        return {"ok": True, "confirmed": 0}
+
+    case = await db.cases.find_one({"_id": ObjectId(case_id)})
+    filenames = [d["filename"] for d in staged]
+    doc_ids = [str(d["_id"]) for d in staged]
+
+    # ── AI summary for each document (background, silent) ────────────────────
+    summaries = {}
+    if ANTHROPIC_API_KEY:
+        try:
+            import anthropic as ant
+            cli = ant.Anthropic(api_key=ANTHROPIC_API_KEY)
+            for doc in staged:
+                fn_lower = (doc.get("filename") or "").lower()
+                text_preview = ""
+                try:
+                    file_bytes = open(doc["file_path"], "rb").read()
+                    if fn_lower.endswith(".txt"):
+                        text_preview = file_bytes.decode("utf-8", errors="ignore")[:3000]
+                    elif fn_lower.endswith(".docx"):
+                        from docx import Document as DocxDoc
+                        import io as _io
+                        d = DocxDoc(_io.BytesIO(file_bytes))
+                        text_preview = "\n".join(p.text for p in d.paragraphs if p.text)[:3000]
+                except Exception:
+                    pass
+                prompt = (
+                    f"Αρχείο από πελάτη: «{doc['filename']}» ({doc.get('size', 0)//1024} KB).\n"
+                    + (f"Περιεχόμενο:\n{text_preview[:2000]}\n\n" if text_preview else "")
+                    + "Γράψε 2-3 προτάσεις σύνοψης ελληνικά για τον χειριστή δικηγόρο. "
+                      "Εστίασε σε τι υποβάλλει ο πελάτης και αν απαιτείται άμεση ενέργεια."
+                )
+                try:
+                    resp = cli.messages.create(
+                        model=MODEL_EXTRACTION, max_tokens=300,
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    summaries[str(doc["_id"])] = resp.content[0].text.strip()
+                except Exception as e:
+                    logger.warning(f"AI summary failed for {doc['filename']}: {e}")
+        except Exception as e:
+            logger.warning(f"AI init failed: {e}")
+
+    # ── Move staged → pending_review ──────────────────────────────────────────
+    for doc in staged:
+        did = str(doc["_id"])
+        await db.documents.update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"status": "pending_review", "ai_summary": summaries.get(did, ""), "confirmed_at": datetime.utcnow()}}
+        )
+
+    # ── Notify lawyer ─────────────────────────────────────────────────────────
+    if case:
+        ai_text = "\n".join(f"• {fn}: {summaries.get(did,'')}" for fn, did in zip(filenames, doc_ids) if summaries.get(did))
+        notif = {
+            "user_id":    case.get("assigned_lawyer_id", ""),
+            "type":       "portal_upload",
+            "title":      f"Νέα έγγραφα από {user.get('client_name', 'πελάτη')} ({len(staged)} αρχεία)",
+            "message":    "Αρχεία: " + ", ".join(filenames) + (f"\n\nΑνάλυση:\n{ai_text}" if ai_text else ""),
+            "case_id":    case_id,
+            "read":       False,
+            "created_at": datetime.utcnow(),
+        }
+        await db.notifications.insert_one(notif)
+
+    await audit("PORTAL_UPLOAD_CONFIRM", user.get("client_id", ""), "document", case_id)
+    return {"ok": True, "confirmed": len(staged)}
+
+@app.get("/api/portal/messages")
+async def portal_get_messages(user=Depends(get_portal_user)):
+    """Client reads their message thread with lawyer."""
+    msgs = await db.portal_messages.find(
+        {"case_id": user["case_id"]}
+    ).sort("created_at", 1).to_list(None)
+    return [serialize(m) for m in msgs]
+
+@app.get("/api/portal/progress")
+async def portal_get_progress(user=Depends(get_portal_user)):
+    """Get upcoming hearings and deadlines for the portal client's case."""
+    case_id  = user["case_id"]
+    now_str  = datetime.utcnow().date().isoformat()
+
+    hearings_raw  = await db.hearings.find({"case_id": case_id}).sort("hearing_date", 1).to_list(None)
+    deadlines_raw = await db.deadlines.find({"case_id": case_id}).sort("date", 1).to_list(None)
+
+    upcoming_hearings = [
+        serialize(h) for h in hearings_raw
+        if str(h.get("hearing_date", ""))[:10] >= now_str
+        and h.get("status") not in ("completed", "cancelled")
+    ]
+    past_hearings = [
+        serialize(h) for h in hearings_raw
+        if str(h.get("hearing_date", ""))[:10] < now_str
+        or h.get("status") in ("completed", "cancelled")
+    ]
+    upcoming_deadlines = [
+        serialize(d) for d in deadlines_raw
+        if str(d.get("date", ""))[:10] >= now_str
+    ]
+    past_deadlines = [
+        serialize(d) for d in deadlines_raw
+        if str(d.get("date", ""))[:10] < now_str
+    ]
+
+    case = await db.cases.find_one({"_id": ObjectId(case_id)})
+    next_action = (case or {}).get("next_action", "")
+    last_action = ""
+    last_event = await db.audit_logs.find_one({"case_id": case_id}, sort=[("created_at", -1)])
+    if last_event:
+        label_map = {
+            "CREATE_NOTE": "Σημείωση",
+            "CREATE_DEADLINE": "Προθεσμία",
+            "UPDATE_STATUS": "Ενημέρωση κατάστασης",
+            "CREATE_INVOICE": "Τιμολόγιο",
+            "CREATE_HEARING": "Δικάσιμος",
+            "PORTAL_UPLOAD": "Ανέβασμα εγγράφου",
+        }
+        act = last_event.get("action", "")
+        last_action = label_map.get(act, act)
+
+    return {
+        "upcoming_hearings":  upcoming_hearings[:5],
+        "past_hearings":      past_hearings[-3:],
+        "upcoming_deadlines": upcoming_deadlines[:5],
+        "past_deadlines":     past_deadlines[-3:],
+        "next_action":        next_action,
+        "last_action":        last_action,
     }
 
-    result = await db.documents.insert_one(doc)
+@app.get("/api/portal/financials")
+async def portal_get_financials(user=Depends(get_portal_user)):
+    """Detailed financial breakdown visible to the portal client."""
+    case_id = user["case_id"]
+    permissions = user.get("permissions", [])
+    if "total_fees" not in permissions and "outstanding_balance" not in permissions:
+        raise HTTPException(403, "Δεν έχετε πρόσβαση στα οικονομικά")
 
-    # Notify lawyer
-    case = await db.cases.find_one({"_id": ObjectId(case_id)})
-    lawyer_id = case.get("assigned_lawyer_id")
-    if lawyer_id:
-        # TODO: Send native notification: "Client uploaded document: {filename}"
-        pass
+    invoices = await db.invoices.find({"case_id": case_id}).sort("date", -1).to_list(None)
+    financials = await db.financials.find({"case_id": case_id}).sort("date", -1).to_list(None)
 
-    await audit("PORTAL_UPLOAD", user.get("client_id", ""), "document", str(result.inserted_id))
-    return {"ok": True, "document_id": str(result.inserted_id), "filename": file.filename}
+    total = sum(float(i.get("total_payable", i.get("total", 0))) for i in invoices)
+    paid  = sum(float(i.get("amount_paid", 0)) for i in invoices)
+
+    inv_list = []
+    for i in invoices:
+        inv_list.append({
+            "id":             str(i["_id"]),
+            "invoice_number": i.get("invoice_number", ""),
+            "description":    i.get("description") or i.get("subject", "—"),
+            "total":          float(i.get("total_payable", i.get("total", 0))),
+            "paid":           float(i.get("amount_paid", 0)),
+            "status":         i.get("payment_status", "pending"),
+            "date":           str(i.get("date", i.get("created_at", "")))[:10],
+        })
+
+    fee_list = []
+    for f in financials:
+        fee_list.append({
+            "id":          str(f["_id"]),
+            "description": f.get("description", "—"),
+            "amount":      float(f.get("amount", 0)),
+            "type":        f.get("type", "fee"),
+            "date":        str(f.get("date", f.get("created_at", "")))[:10],
+        })
+
+    settings_doc = await db.settings.find_one({"_id": "global"}) or {}
+    bank_accounts = settings_doc.get("bank_accounts", [])
+
+    return {
+        "total":         round(total, 2),
+        "paid":          round(paid, 2),
+        "outstanding":   round(total - paid, 2),
+        "invoices":      inv_list,
+        "fee_entries":   fee_list,
+        "bank_accounts": bank_accounts,
+    }
+
+@app.get("/api/admin/portal-documents")
+async def list_portal_documents(user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER))):
+    """List portal-uploaded documents awaiting lawyer review."""
+    q: dict = {"uploaded_by": "portal_client"}
+    if user["role"] == UserRole.LAWYER.value:
+        case_ids = [str(c["_id"]) async for c in db.cases.find({"assigned_lawyer_id": user["id"]}, {"_id": 1})]
+        q["case_id"] = {"$in": case_ids}
+    docs = await db.documents.find(q).sort("created_at", -1).to_list(None)
+    result = []
+    for d in docs:
+        s = serialize(d)
+        case = await db.cases.find_one({"_id": make_id(s.get("case_id", ""))})
+        s["case_title"]  = case.get("title", "—") if case else "—"
+        s["case_number"] = case.get("case_number", "") if case else ""
+        result.append(s)
+    return result
+
+@app.post("/api/admin/portal-documents/{doc_id}/approve")
+async def approve_portal_document(doc_id: str, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER))):
+    """Lawyer approves portal document → uploads to Google Drive."""
+    doc = await db.documents.find_one({"_id": make_id(doc_id)})
+    if not doc:
+        raise HTTPException(404, "Έγγραφο δεν βρέθηκε")
+
+    drive_link = None
+    try:
+        from gdrive_service import is_configured, upload_document as drive_upload
+        if is_configured():
+            case = await db.cases.find_one({"_id": make_id(doc["case_id"])})
+            client_name = doc.get("uploaded_by_name", "Πελάτης")
+            year = str(datetime.utcnow().year)
+            case_number = case.get("case_number", "") if case else ""
+            case_title  = (case.get("title") or "Υπόθεση")[:30] if case else "Υπόθεση"
+            case_folder = f"{case_number} - {case_title}" if case_number else case_title
+
+            with open(doc["file_path"], "rb") as fh:
+                file_bytes = fh.read()
+
+            drive_result = drive_upload(
+                file_bytes=file_bytes,
+                filename=doc["filename"],
+                mime_type=doc.get("mime_type", "application/octet-stream"),
+                year=year,
+                client_name=client_name[:50],
+                case_folder=case_folder,
+            )
+            drive_link = drive_result.get("folder_link") or drive_result.get("file_link")
+    except Exception as e:
+        logger.warning(f"Drive upload failed: {e}")
+
+    await db.documents.update_one(
+        {"_id": make_id(doc_id)},
+        {"$set": {
+            "status":      "approved",
+            "reviewed_by": user["id"],
+            "reviewed_at": datetime.utcnow(),
+            "drive_link":  drive_link,
+        }}
+    )
+    await audit("APPROVE_PORTAL_DOC", user["id"], "document", doc_id)
+    return {"ok": True, "drive_link": drive_link}
+
+@app.post("/api/admin/portal-documents/{doc_id}/reject")
+async def reject_portal_document(doc_id: str, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER))):
+    """Lawyer rejects (ignores) portal document."""
+    await db.documents.update_one(
+        {"_id": make_id(doc_id)},
+        {"$set": {"status": "rejected", "reviewed_by": user["id"], "reviewed_at": datetime.utcnow()}}
+    )
+    await audit("REJECT_PORTAL_DOC", user["id"], "document", doc_id)
+    return {"ok": True}
 
 # ── Admin Portal Management ──
 @app.post("/api/admin/clients/{client_id}/generate-portal-access")
 async def generate_portal_access(client_id: str, req: PortalAccessRequest, user=Depends(require_role(UserRole.ADMIN))):
-    """Generate portal access code for client"""
-    # Find client and their active cases
+    """Generate portal access code for a specific client case."""
     try:
-        client_oid = ObjectId(client_id)
+        ObjectId(client_id)
     except InvalidId:
         raise HTTPException(400, "Μη έγκυρο client ID")
 
-    cases = await db.cases.find({"client_id": client_id, "status": {"$in": ["active", "pending"]}}).to_list(None)
-    if not cases:
-        raise HTTPException(404, "Δεν υπάρχουν ενεργές υποθέσεις")
+    # Get client name
+    client = await db.clients.find_one({"_id": make_id(client_id)})
+    if not client:
+        raise HTTPException(404, "Εντολέας δεν βρέθηκε")
+    client_name = client.get("full_name") or client.get("name", "")
 
-    # Create portal access for first case
-    case = cases[0]
+    # Use specific case if provided, else first active case
+    if req.case_id:
+        case = await db.cases.find_one({"_id": make_id(req.case_id)})
+        if not case:
+            raise HTTPException(404, "Υπόθεση δεν βρέθηκε")
+    else:
+        cases = await db.cases.find(
+            {"$or": [{"client_id": client_id}, {"client_ids": client_id}],
+             "status": {"$in": ["active", "pending"]}}
+        ).to_list(None)
+        if not cases:
+            raise HTTPException(404, "Δεν υπάρχουν ενεργές υποθέσεις")
+        case = cases[0]
+
     portal_code = secrets.token_urlsafe(12)
-
     access_record = {
-        "client_id": client_id,
-        "case_id": str(case["_id"]),
-        "portal_code": portal_code,
-        "permissions": req.permissions,
-        "is_active": True,
-        "created_at": datetime.utcnow(),
-        "created_by": user["id"]
+        "client_id":    client_id,
+        "client_name":  client_name,
+        "case_id":      str(case["_id"]),
+        "case_title":   case.get("title") or case.get("offense") or "—",
+        "case_number":  case.get("case_number") or "",
+        "case_category": case.get("category") or case.get("legal_category") or "",
+        "portal_code":  portal_code,
+        "permissions":     req.permissions,
+        "is_active":       True,
+        "created_at":      datetime.utcnow(),
+        "expires_at":      datetime.utcnow() + timedelta(days=PORTAL_CODE_TTL_DAYS),
+        "created_by":      user["id"],
+        "client_email":    client.get("email") or "",
+        "mandate_accepted": False,
     }
-
     result = await db.portal_access.insert_one(access_record)
-
-    # TODO: Send email to client with portal_code and link
 
     await audit("CREATE_PORTAL_ACCESS", user["id"], "portal", str(result.inserted_id))
     return {
-        "ok": True,
+        "ok":          True,
         "portal_code": portal_code,
-        "case_id": str(case["_id"]),
-        "case_title": case.get("title"),
-        "message": "Portal code generated and email sent to client"
+        "case_id":     str(case["_id"]),
+        "case_title":  case.get("title"),
+        "client_name": client_name,
     }
 
 @app.patch("/api/admin/cases/{case_id}/portal-permissions")
@@ -1462,6 +2217,122 @@ async def reject_portal_reset(request_id: str, user=Depends(require_role(UserRol
     await audit("REJECT_PORTAL_RESET", user["id"], "portal", request_id)
     return {"ok": True}
 
+# ── Admin: Portal Message Inbox ───────────────────────────────────────────────
+
+@app.get("/api/admin/portal-messages")
+async def list_portal_messages(user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER))):
+    """List all portal messages with case/client info for the lawyer inbox."""
+    q: dict = {}
+    if user["role"] == UserRole.LAWYER.value:
+        case_ids = [str(c["_id"]) async for c in db.cases.find({"assigned_lawyer_id": user["id"]}, {"_id": 1})]
+        q["case_id"] = {"$in": case_ids}
+    msgs = await db.portal_messages.find(q).sort("created_at", -1).to_list(None)
+    result = []
+    for m in msgs:
+        s = serialize(m)
+        case = await db.cases.find_one({"_id": make_id(s.get("case_id", ""))})
+        s["case_title"]  = (case.get("title") or "—") if case else "—"
+        s["case_number"] = (case.get("case_number") or "") if case else ""
+        result.append(s)
+    return result
+
+@app.patch("/api/admin/portal-messages/{msg_id}/read")
+async def mark_portal_message_read(msg_id: str, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER))):
+    """Mark a portal message as read."""
+    await db.portal_messages.update_one(
+        {"_id": make_id(msg_id)},
+        {"$set": {"read": True, "read_by_lawyer": True, "read_at": datetime.utcnow()}}
+    )
+    return {"ok": True}
+
+class PortalReplyRequest(BaseModel):
+    content: str
+
+@app.post("/api/admin/portal-messages/{msg_id}/reply")
+async def reply_portal_message(msg_id: str, req: PortalReplyRequest, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER))):
+    """Lawyer replies to a portal message — stores reply and emails the client."""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    msg = await db.portal_messages.find_one({"_id": make_id(msg_id)})
+    if not msg:
+        raise HTTPException(404, "Μήνυμα δεν βρέθηκε")
+
+    reply = {
+        "author":     user.get("full_name") or user.get("name") or "Δικηγόρος",
+        "content":    sanitize_string(req.content),
+        "created_at": datetime.utcnow().isoformat(),
+        "role":       "lawyer",
+    }
+
+    await db.portal_messages.update_one(
+        {"_id": make_id(msg_id)},
+        {
+            "$push": {"replies": reply},
+            "$set":  {"read": True, "read_by_lawyer": True},
+        }
+    )
+
+    # Send email to client if we have their email
+    case_id = msg.get("case_id", "")
+    client_email = ""
+    client_name  = msg.get("client_name", "Πελάτης")
+    if case_id:
+        pa = await db.portal_access.find_one({"case_id": case_id})
+        if pa:
+            client_obj = await db.clients.find_one({"_id": make_id(pa.get("client_id", ""))})
+            if client_obj:
+                client_email = client_obj.get("email", "")
+
+    if client_email:
+        try:
+            settings_doc = await db.settings.find_one({"_id": "global"}) or {}
+            smtp_host = settings_doc.get("smtp_host") or os.getenv("SMTP_HOST", "")
+            smtp_port = int(settings_doc.get("smtp_port") or os.getenv("SMTP_PORT", "587"))
+            smtp_user = settings_doc.get("smtp_user") or os.getenv("SMTP_USER", "")
+            smtp_pass = settings_doc.get("smtp_pass") or os.getenv("SMTP_PASS", "")
+            from_email = settings_doc.get("notification_email") or smtp_user or FIRM_EMAIL_DISPLAY
+
+            noreply_addr = os.getenv("SMTP_FROM", from_email)
+            lawyer_name  = user.get("full_name") or user.get("name") or reply["author"]
+            lawyer_email = user.get("email") or ""
+
+            if smtp_host and smtp_user:
+                body_html = f"""
+<html><body style="font-family:Arial,sans-serif;color:#222;max-width:600px;margin:auto">
+<div style="background:#071220;padding:24px;border-radius:8px;margin-bottom:24px">
+  <h2 style="color:#C6A75E;margin:0">NOMOS ONE — Σκοτάνης &amp; Συνεργάτες</h2>
+  <p style="color:#8aa0b8;margin:4px 0 0">Απάντηση στο μήνυμά σας</p>
+</div>
+<p>Αγαπητέ/ή {client_name},</p>
+<p>Λάβατε απάντηση από τον/την {lawyer_name}:</p>
+<div style="background:#f4f4f4;border-left:4px solid #C6A75E;padding:16px;border-radius:4px;margin:16px 0">
+  <p style="margin:0;white-space:pre-wrap">{reply['content']}</p>
+</div>
+<p>Μπορείτε να συνδεθείτε στην Πύλη Πελάτη για να δείτε όλη την αλληλογραφία.</p>
+{f'<p>Για άμεση επικοινωνία: <a href="mailto:{lawyer_email}">{lawyer_email}</a></p>' if lawyer_email else ''}
+<p style="color:#888;font-size:12px;margin-top:32px">Σκοτάνης &amp; Συνεργάτες — Εμπιστευτική Επικοινωνία</p>
+</body></html>"""
+                mail = MIMEMultipart("alternative")
+                mail["Subject"]  = f"Απάντηση από {lawyer_name} — Πύλη Πελάτη NOMOS ONE"
+                mail["From"]     = f"{lawyer_name} — Σκοτάνης & Συνεργάτες <{noreply_addr}>"
+                mail["To"]       = f"{client_name} <{client_email}>"
+                if lawyer_email:
+                    mail["Reply-To"] = lawyer_email
+                mail.attach(MIMEText(body_html, "html", "utf-8"))
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as srv:
+                    srv.ehlo(); srv.starttls(); srv.login(smtp_user, smtp_pass)
+                    srv.sendmail(noreply_addr, client_email, mail.as_string())
+                await db.email_logs.insert_one({
+                    "to": client_email, "subject": f"Απάντηση από {lawyer_name}",
+                    "sent_by": user["id"], "sent_at": datetime.utcnow(), "status": "sent"
+                })
+        except Exception as e:
+            logger.warning(f"Reply email failed: {e}")
+
+    await audit("PORTAL_REPLY", user["id"], "portal", msg_id)
+    return {"ok": True, "email_sent": bool(client_email)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1475,13 +2346,125 @@ class ClientRequest(BaseModel):
 @app.get("/api/clients")
 async def list_clients(user=Depends(get_current_user)):
     clients = await db.clients.find({}).to_list(None)
-    return [serialize(c) for c in clients]
+    result = []
+    for c in clients:
+        s = serialize(c)
+        cid = s["id"]
+        s["cases_count"] = await db.cases.count_documents(
+            {"$or": [{"client_id": cid}, {"client_ids": cid}]}
+        )
+        result.append(s)
+    return result
+
+@app.get("/api/clients/{client_id}/cases")
+async def get_client_cases(client_id: str, user=Depends(get_current_user)):
+    """All cases where this client appears (primary or co-client)."""
+    cases = await db.cases.find(
+        {"$or": [{"client_id": client_id}, {"client_ids": client_id}]}
+    ).sort("created_at", -1).to_list(None)
+    result = []
+    for c in cases:
+        s = serialize(c)
+        s["client_name"] = await get_client_name(s.get("client_id", ""))
+        # Populate all client names for multi-client cases
+        extra_ids = s.get("client_ids", [])
+        if len(extra_ids) > 1:
+            names = []
+            for cid in extra_ids:
+                n = await get_client_name(cid)
+                if n and n not in names:
+                    names.append(n)
+            s["client_names"] = names
+        result.append(s)
+    return result
 
 @app.get("/api/clients/{client_id}")
 async def get_client(client_id: str, user=Depends(get_current_user)):
     doc = await db.clients.find_one({"_id": make_id(client_id)})
     if not doc: raise HTTPException(404, "Ο εντολέας δεν βρέθηκε")
-    return serialize(doc)
+    s = serialize(doc)
+    s["cases_count"] = await db.cases.count_documents(
+        {"$or": [{"client_id": client_id}, {"client_ids": client_id}]}
+    )
+    return s
+
+@app.get("/api/clients/{client_id}/360")
+async def client_360(client_id: str, user=Depends(get_current_user)):
+    """Full 360° profile for a client — all linked cases, hearings, deadlines, financials."""
+    client = await db.clients.find_one({"_id": make_id(client_id)})
+    if not client:
+        raise HTTPException(404, "Εντολέας δεν βρέθηκε")
+
+    cases = await db.cases.find(
+        {"$or": [{"client_id": client_id}, {"client_ids": client_id}]}
+    ).sort("created_at", -1).to_list(None)
+    case_ids = [str(c["_id"]) for c in cases]
+
+    enriched_cases = []
+    for c in cases:
+        s = serialize(c)
+        s["client_name"] = await get_client_name(s.get("client_id", ""))
+        s["assigned_lawyer_name"] = await get_user_name(s.get("assigned_lawyer_id", ""))
+        enriched_cases.append(s)
+
+    if case_ids:
+        hearings_raw   = await db.hearings.find({"case_id": {"$in": case_ids}}).sort("hearing_date", 1).to_list(None)
+        deadlines_raw  = await db.deadlines.find({"case_id": {"$in": case_ids}}).sort("date", 1).to_list(None)
+        invoices_raw   = await db.invoices.find({"case_id": {"$in": case_ids}}).to_list(None)
+        doc_count      = await db.documents.count_documents({"case_id": {"$in": case_ids}})
+        note_count     = await db.notes.count_documents({"case_id": {"$in": case_ids}})
+    else:
+        hearings_raw = deadlines_raw = invoices_raw = []
+        doc_count = note_count = 0
+
+    case_map = {str(c["_id"]): c for c in cases}
+    def _case_label(cid: str) -> str:
+        c = case_map.get(cid, {})
+        return c.get("offense") or c.get("title") or cid[:8]
+
+    hearings = []
+    for h in hearings_raw:
+        s = serialize(h); s["case_label"] = _case_label(s.get("case_id", "")); hearings.append(s)
+
+    deadlines = []
+    for d in deadlines_raw:
+        s = serialize(d); s["case_label"] = _case_label(s.get("case_id", "")); deadlines.append(s)
+
+    total_invoiced = sum(float(i.get("total_payable", i.get("total", 0))) for i in invoices_raw)
+    total_paid     = sum(float(i.get("amount_paid", 0)) for i in invoices_raw)
+
+    case_fin: dict = {}
+    for i in invoices_raw:
+        cid = i.get("case_id", "")
+        if cid not in case_fin:
+            case_fin[cid] = {"invoiced": 0.0, "paid": 0.0}
+        case_fin[cid]["invoiced"] += float(i.get("total_payable", i.get("total", 0)))
+        case_fin[cid]["paid"]     += float(i.get("amount_paid", 0))
+
+    now_str = datetime.utcnow().isoformat()[:10]
+    upcoming_hearings  = [h for h in hearings  if str(h.get("hearing_date", ""))[:10] >= now_str and h.get("status") not in ("completed", "cancelled")]
+    upcoming_deadlines = [d for d in deadlines if str(d.get("date", ""))[:10] >= now_str]
+
+    return {
+        "client": serialize(client),
+        "stats": {
+            "cases_total":        len(cases),
+            "cases_active":       sum(1 for c in cases if not str(c.get("status","")).startswith("closed") and c.get("status") != "archived"),
+            "hearings_upcoming":  len(upcoming_hearings),
+            "deadlines_upcoming": len(upcoming_deadlines),
+            "doc_count":          doc_count,
+            "note_count":         note_count,
+            "total_invoiced":     total_invoiced,
+            "total_paid":         total_paid,
+            "balance":            total_invoiced - total_paid,
+        },
+        "cases":           enriched_cases,
+        "hearings":        hearings,
+        "deadlines":       deadlines,
+        "case_financials": case_fin,
+        "invoices":        [serialize(i) for i in invoices_raw],
+    }
+
 
 @app.post("/api/clients", status_code=201)
 async def create_client(req: ClientRequest, user=Depends(require_role(UserRole.ADMIN, UserRole.SECRETARY))):
@@ -1515,7 +2498,7 @@ async def update_client(client_id: str, req: ClientRequest, user=Depends(require
 async def export_client(client_id: str, user=Depends(require_role(UserRole.ADMIN, UserRole.SECRETARY))):
     doc = await db.clients.find_one({"_id": make_id(client_id)})
     if not doc: raise HTTPException(404, "Ο εντολέας δεν βρέθηκε")
-    cases = await db.cases.find({"client_id": client_id}).to_list(None)
+    cases = await db.cases.find({"$or": [{"client_id": client_id}, {"client_ids": client_id}]}).to_list(None)
     export_data = {"client": serialize(doc), "cases": [serialize(c) for c in cases], "exported_at": datetime.utcnow().isoformat()}
     await audit("EXPORT_CLIENT", user["id"], "client", client_id)
     content = json.dumps(export_data, ensure_ascii=False, indent=2, default=str)
@@ -1530,6 +2513,7 @@ class CaseRequest(BaseModel):
     status: CaseStatus = CaseStatus.ACTIVE; legal_category: Optional[str] = None; category: Optional[str] = None
     next_action: Optional[str] = None; next_action_date: Optional[datetime] = None; court: Optional[str] = None
     description: Optional[str] = None; summary: Optional[str] = None
+    offense: Optional[str] = None; law_articles: Optional[str] = None
 
 class CaseStatusUpdate(BaseModel):
     status: CaseStatus; next_action: Optional[str] = None; next_action_date: Optional[datetime] = None
@@ -1571,39 +2555,51 @@ async def approve_pending_intake(intake_id: str, user=Depends(require_role(UserR
     cl = extracted.get("client") or {}
     cs = extracted.get("case") or {}
 
-    client_name = intake.get("client_name") or cl.get("full_name", "Άγνωστος")
-    existing_client = None
-    if cl.get("afm"):
-        existing_client = await db.clients.find_one({"afm": cl["afm"]})
-    if not existing_client and client_name:
-        existing_client = await db.clients.find_one(
-            {"full_name": {"$regex": client_name[:10], "$options": "i"}}
-        )
+    # Support multiple clients selected via Telegram multi-select
+    client_names = intake.get("client_names") or []
+    primary_name = intake.get("client_name") or cl.get("full_name", "Άγνωστος")
+    if not client_names:
+        client_names = [primary_name]
 
-    if existing_client:
-        client_id = str(existing_client["_id"])
-    else:
-        client_doc = {
-            "full_name": client_name,
-            "afm": cl.get("afm"),
-            "phone": cl.get("phone", ""),
-            "email": cl.get("email", ""),
-            "address": cl.get("address", ""),
+    async def _find_or_create_client(name: str, afm: str | None, is_primary: bool) -> str:
+        existing = None
+        if is_primary and afm:
+            existing = await db.clients.find_one({"afm": afm})
+        if not existing and name:
+            existing = await db.clients.find_one(
+                {"full_name": {"$regex": re.escape(name[:15]), "$options": "i"}}
+            )
+        if existing:
+            return str(existing["_id"])
+        doc = {
+            "full_name": name,
+            "afm": afm if is_primary else None,
+            "phone": cl.get("phone", "") if is_primary else "",
+            "email": cl.get("email", "") if is_primary else "",
+            "address": cl.get("address", "") if is_primary else "",
             "client_type": cl.get("client_type", "individual"),
             "is_active": True,
             "source": "intake_channel",
             "created_at": now,
             "created_by": user["id"],
         }
-        cr = await db.clients.insert_one(client_doc)
-        client_id = str(cr.inserted_id)
-        await audit("CREATE_CLIENT", user["id"], "client", client_id)
+        cr = await db.clients.insert_one(doc)
+        cid = str(cr.inserted_id)
+        await audit("CREATE_CLIENT", user["id"], "client", cid)
+        return cid
 
+    client_ids = []
+    for i, name in enumerate(client_names):
+        cid = await _find_or_create_client(name, cl.get("afm") if i == 0 else None, i == 0)
+        client_ids.append(cid)
+
+    primary_client_id = client_ids[0]
     cn = await case_number_gen()
-    case_title = cs.get("title") or f"Υπόθεση {client_name}"
+    case_title = cs.get("title") or f"Υπόθεση {primary_name}"
     case_doc = {
         "title": case_title,
-        "client_id": client_id,
+        "client_id": primary_client_id,
+        "client_ids": client_ids,
         "assigned_lawyer_id": user["id"],
         "status": "active",
         "legal_category": cs.get("category", "αστικό"),
@@ -1631,12 +2627,14 @@ async def approve_pending_intake(intake_id: str, user=Depends(require_role(UserR
             "status": "approved",
             "reviewed_by": user["id"],
             "reviewed_at": now,
-            "created_client_id": client_id,
+            "created_client_ids": client_ids,
+            "created_client_id": primary_client_id,
             "created_case_id": case_id,
             "created_case_number": cn,
         }}
     )
-    return {"status": "approved", "case_number": cn, "case_id": case_id, "client_id": client_id}
+    return {"status": "approved", "case_number": cn, "case_id": case_id,
+            "client_id": primary_client_id, "client_ids": client_ids}
 
 
 @app.post("/api/pending-intakes/{intake_id}/reject")
@@ -1669,6 +2667,15 @@ async def list_cases(user=Depends(get_current_user), status: Optional[str] = Non
         s = serialize(c)
         s["assigned_lawyer_name"] = await get_user_name(s.get("assigned_lawyer_id", ""))
         s["client_name"] = await get_client_name(s.get("client_id", ""))
+        # For multi-client cases, populate all client names
+        extra_ids = s.get("client_ids", [])
+        if len(extra_ids) > 1:
+            names = []
+            for cid in extra_ids:
+                n = await get_client_name(cid)
+                if n and n not in names:
+                    names.append(n)
+            s["client_names"] = names
         result.append(s)
     return result
 
@@ -1690,6 +2697,15 @@ async def get_case(case_id: str, user=Depends(get_current_user)):
     s = serialize(case)
     s["assigned_lawyer_name"] = await get_user_name(s.get("assigned_lawyer_id", ""))
     s["client_name"] = await get_client_name(s.get("client_id", ""))
+    # Populate full client objects for all linked clients
+    client_ids = s.get("client_ids") or ([s["client_id"]] if s.get("client_id") else [])
+    clients_detail = []
+    for cid in client_ids:
+        cd = await db.clients.find_one({"_id": make_id(cid)})
+        if cd:
+            clients_detail.append(serialize(cd))
+    if clients_detail:
+        s["clients"] = clients_detail
     return s
 
 @app.post("/api/cases", status_code=201)
@@ -1705,6 +2721,8 @@ async def create_case(req: CaseRequest, user=Depends(get_current_user)):
            "assigned_lawyer_id": lawyer_id, "status": req.status.value,
            "next_action": sanitize_string(req.next_action or ""), "next_action_date": req.next_action_date,
            "legal_category": req.category or req.legal_category,
+           "offense": sanitize_string(req.offense) if req.offense else None,
+           "law_articles": sanitize_string(req.law_articles) if req.law_articles else None,
            "court": sanitize_string(req.court) if req.court else None,
            "description": sanitize_string(req.summary or req.description or "") if (req.summary or req.description) else None,
            "case_number": cn, "created_at": datetime.utcnow(), "created_by": user["id"],
@@ -2056,6 +3074,7 @@ async def upcoming_deadlines(user=Depends(get_current_user), days: int = 14):
 async def create_deadline(req: DeadlineRequest, user=Depends(get_current_user)):
     if req.case_id:
         await _check_case_access(req.case_id, user)
+        await _check_payment_gate(req.case_id, f"Προθεσμία: {req.title}")
     doc = {
         "case_id": req.case_id,
         "title": sanitize_string(req.title),
@@ -2467,131 +3486,674 @@ async def case_invoices(case_id: str, user=Depends(get_current_user)):
 # PHASE 5: DOCUMENT TEMPLATES
 # ══════════════════════════════════════════════════════════════════════════════
 # Built-in Greek legal document templates with auto-fill
+# ─────────────────────────────────────────────────────────────────────────────
+# LEGAL DOCUMENT TEMPLATES  (νομικά πλήρη πρότυπα)
+# Each field entry: {"name": str, "label": str, "type": "text"|"date"|"textarea", "required": bool}
+# ─────────────────────────────────────────────────────────────────────────────
 TEMPLATES = {
+    # ── 1. ΕΞΟΥΣΙΟΔΟΤΗΣΗ ──────────────────────────────────────────────────────
     "exousiodotisi": {
         "id": "exousiodotisi",
         "name": "Εξουσιοδότηση",
-        "description": "Γενική εξουσιοδότηση προς δικηγόρο",
-        "category": "general",
-        "fields": ["client_name", "client_tax_id", "client_address", "lawyer_name", "case_title", "court", "date"],
+        "description": "Γενική εξουσιοδότηση προς δικηγόρο για δικαστική εκπροσώπηση",
+        "category": "Γενικό",
+        "fields": [
+            {"name":"_case_id","label":"Υπόθεση (προαιρετική — συμπληρώνει αυτόματα)","type":"linked","linked_to":"cases","required":False},
+            {"name":"_client_id","label":"Εντολέας (εναλλακτικά, αν δεν υπάρχει υπόθεση)","type":"linked","linked_to":"clients","required":False},
+            {"name":"client_name","label":"Ονοματεπώνυμο εντολέα","type":"text","required":True},
+            {"name":"client_father","label":"Πατρώνυμο εντολέα","type":"text","required":True},
+            {"name":"client_id_number","label":"Αρ. Δελτίου Ταυτότητας / Διαβατηρίου","type":"text","required":True},
+            {"name":"client_tax_id","label":"ΑΦΜ εντολέα","type":"text","required":True},
+            {"name":"client_address","label":"Πλήρης διεύθυνση κατοικίας","type":"text","required":True},
+            {"name":"client_phone","label":"Τηλέφωνο εντολέα","type":"text","required":False},
+            {"name":"lawyer_name","label":"Ονοματεπώνυμο δικηγόρου","type":"text","required":True},
+            {"name":"lawyer_am","label":"Αριθμός Μητρώου (ΑΜ) δικηγόρου","type":"text","required":True},
+            {"name":"lawyer_dsb","label":"Δικηγορικός Σύλλογος δικηγόρου","type":"text","required":True},
+            {"name":"case_title","label":"Τίτλος / αντικείμενο υπόθεσης","type":"text","required":True},
+            {"name":"court","label":"Δικαστήριο / Αρχή","type":"text","required":True},
+            {"name":"city","label":"Πόλη σύνταξης","type":"text","required":True},
+            {"name":"date","label":"Ημερομηνία","type":"date","required":True},
+        ],
         "template": """ΕΞΟΥΣΙΟΔΟΤΗΣΗ
 
-Ο/Η κάτωθι υπογράφων/ουσα {{client_name}}, κάτοικος {{client_address}}, με ΑΦΜ {{client_tax_id}},
+Εγώ, ο/η κάτωθι υπογράφων/ουσα {{client_name}}, του/της {{client_father}}, κάτοικος {{client_address}}, κάτοχος Δ.Α.Τ. / Διαβατηρίου αριθ. {{client_id_number}}, με Α.Φ.Μ. {{client_tax_id}}, τηλ. {{client_phone}},
 
 ΕΞΟΥΣΙΟΔΟΤΩ
 
-τον/την Δικηγόρο {{lawyer_name}} όπως με εκπροσωπήσει ενώπιον {{court}} στην υπόθεση «{{case_title}}» και γενικά να προβεί σε κάθε νόμιμη ενέργεια για την προάσπιση των συμφερόντων μου.
+τον/την Δικηγόρο {{lawyer_name}}, μέλος του Δικηγορικού Συλλόγου {{lawyer_dsb}} (Α.Μ. {{lawyer_am}}), να με εκπροσωπεί νόμιμα σε κάθε ενέργεια σχετική με την υπόθεση «{{case_title}}» ενώπιον {{court}} και κάθε άλλης αρμόδιας αρχής, δικαστηρίου ή υπηρεσίας.
 
-{{client_address}}, {{date}}
+Ειδικότερα εξουσιοδοτώ τον/την ανωτέρω να:
+α) Καταθέτει, υπογράφει και υποβάλλει κάθε δικόγραφο, αίτηση, δήλωση ή υπόμνημα.
+β) Εκπροσωπεί τα συμφέροντά μου ενώπιον δικαστηρίων, εισαγγελιών, αστυνομικών, διοικητικών και λοιπών αρχών.
+γ) Λαμβάνει γνώση κάθε εγγράφου και να υπογράφει πρακτικά συζητήσεων.
+δ) Ασκεί κάθε νόμιμο ένδικο μέσο ή βοήθημα.
+ε) Διενεργεί κάθε απαραίτητη νόμιμη ενέργεια για την προάσπιση των δικαιωμάτων και συμφερόντων μου.
+
+Η παρούσα ισχύει μέχρι ρητής ανάκλησής της.
+
+{{city}}, {{date}}
 
 Ο/Η Εξουσιοδοτών/ούσα
 
 
-
-______________________________
+_________________________________
 {{client_name}}"""
     },
+
+    # ── 2. ΕΙΔΙΚΟ ΠΛΗΡΕΞΟΥΣΙΟ ─────────────────────────────────────────────────
     "plirexousio": {
         "id": "plirexousio",
-        "name": "Πληρεξούσιο",
-        "description": "Ειδικό πληρεξούσιο για παράσταση σε δίκη",
-        "category": "court",
-        "fields": ["client_name", "client_tax_id", "client_address", "lawyer_name", "lawyer_am", "case_title", "court", "date", "case_number"],
+        "name": "Ειδικό Πληρεξούσιο",
+        "description": "Ειδικό πληρεξούσιο για παράσταση σε δίκη (άρθρο 96 ΚΠολΔ)",
+        "category": "Δικαστικό",
+        "fields": [
+            {"name":"_case_id","label":"Υπόθεση (συμπληρώνει αυτόματα)","type":"linked","linked_to":"cases","required":False},
+            {"name":"client_name","label":"Ονοματεπώνυμο εντολέα","type":"text","required":True},
+            {"name":"client_father","label":"Πατρώνυμο εντολέα","type":"text","required":True},
+            {"name":"client_id_number","label":"Αρ. Δ.Α.Τ. / Διαβατηρίου","type":"text","required":True},
+            {"name":"client_tax_id","label":"ΑΦΜ εντολέα","type":"text","required":True},
+            {"name":"client_address","label":"Διεύθυνση κατοικίας","type":"text","required":True},
+            {"name":"client_phone","label":"Τηλέφωνο","type":"text","required":False},
+            {"name":"lawyer_name","label":"Ονοματεπώνυμο δικηγόρου","type":"text","required":True},
+            {"name":"lawyer_am","label":"Αριθμός Μητρώου (ΑΜ)","type":"text","required":True},
+            {"name":"lawyer_dsb","label":"Δικηγορικός Σύλλογος","type":"text","required":True},
+            {"name":"lawyer_address","label":"Διεύθυνση δικηγορικού γραφείου","type":"text","required":False},
+            {"name":"court","label":"Δικαστήριο","type":"text","required":True},
+            {"name":"hearing_date","label":"Ημερομηνία δικασίμου","type":"date","required":True},
+            {"name":"case_title","label":"Αντικείμενο / τίτλος υπόθεσης","type":"text","required":True},
+            {"name":"case_number","label":"Αριθμός Υπόθεσης (ΓΑΚ/ΕΑΚ)","type":"text","required":False},
+            {"name":"opponent_name","label":"Ονοματεπώνυμο αντιδίκου","type":"text","required":False},
+            {"name":"city","label":"Πόλη σύνταξης","type":"text","required":True},
+            {"name":"date","label":"Ημερομηνία σύνταξης","type":"date","required":True},
+        ],
         "template": """ΕΙΔΙΚΟ ΠΛΗΡΕΞΟΥΣΙΟ
+(κατ' άρθρο 96 Κ.Πολ.Δ.)
 
-Ο/Η κάτωθι υπογράφων/ουσα {{client_name}}, κάτοικος {{client_address}}, με ΑΦΜ {{client_tax_id}},
+Εγώ, ο/η {{client_name}}, του/της {{client_father}}, κάτοικος {{client_address}}, κάτοχος Δ.Α.Τ. / Διαβατηρίου αριθ. {{client_id_number}}, Α.Φ.Μ. {{client_tax_id}}, τηλ. {{client_phone}},
 
 ΔΙΟΡΙΖΩ
 
-ειδικό/ή πληρεξούσιο/α Δικηγόρο μου τον/την {{lawyer_name}} (Α.Μ. {{lawyer_am}}) και του/της δίδω την εντολή και πληρεξουσιότητα:
+ειδικό/ή πληρεξούσιο/α Δικηγόρο μου τον/την {{lawyer_name}}, Δικηγόρο {{lawyer_dsb}}, Α.Μ. {{lawyer_am}}, (οδός {{lawyer_address}}), και του/της παρέχω πλήρη εξουσία και πληρεξουσιότητα να:
 
-Να παρασταθεί για λογαριασμό μου ενώπιον {{court}} κατά τη συζήτηση της υπόθεσης «{{case_title}}» (Αρ. Υπόθεσης: {{case_number}}) και να ασκήσει κάθε νόμιμο ένδικο μέσο ή βοήθημα.
+1. Παρασταθεί ενώπιον {{court}} κατά τη δικάσιμο της {{hearing_date}} για τη συζήτηση της υπόθεσης «{{case_title}}» (Αρ. {{case_number}}) μεταξύ εμού και του/της {{opponent_name}}.
+2. Αναβάλει ή μετακινεί τη συζήτηση, συμφωνεί με τον αντίδικο για τόπο και χρόνο εξέτασης μαρτύρων.
+3. Παρίσταται σε κάθε αναβολή ή μετά από αναβολή.
+4. Αποδέχεται ή αρνείται έγγραφα του αντιδίκου, ασκεί παρεμπίπτουσες αγωγές ή αντίκρουσή τους.
+5. Ασκεί κάθε ένδικο μέσο (έφεση, αναίρεση, αναψηλάφηση, αντιτιθέμενη έφεση, τριτανακοπή).
+6. Εκδίδει και παραλαμβάνει αντίγραφα αποφάσεων και δικογράφων.
+7. Προβαίνει σε κάθε απαραίτητη νόμιμη ενέργεια για την ευόδωση της παραπάνω υπόθεσης.
 
-Να υπογράψει κάθε σχετικό έγγραφο και γενικά να ενεργήσει καθετί που κρίνει σκόπιμο για την προάσπιση των συμφερόντων μου.
+Ό,τι πράξει ο/η ανωτέρω Δικηγόρος εντός των ορίων της παρούσας πληρεξουσιότητας θεωρώ ισχυρό και δεσμευτικό για εμένα.
 
-{{client_address}}, {{date}}
+{{city}}, {{date}}
 
 Ο/Η Εντολέας
 
 
-
-______________________________
-{{client_name}}"""
+_________________________________
+{{client_name}}
+(Υπογραφή)"""
     },
+
+    # ── 3. ΜΗΝΥΣΗ / ΕΓΚΛΗΣΗ ───────────────────────────────────────────────────
     "minusi": {
         "id": "minusi",
-        "name": "Μήνυση",
-        "description": "Μήνυση / Έγκληση",
-        "category": "criminal",
-        "fields": ["client_name", "client_tax_id", "client_address", "opponent_name", "opponent_address", "description", "date", "court"],
-        "template": """ΜΗΝΥΣΗ – ΕΓΚΛΗΣΗ
+        "name": "Μήνυση – Έγκληση",
+        "description": "Μήνυση/Έγκληση ενώπιον Εισαγγελέα (άρθρα 40-43 ΚΠΔ)",
+        "category": "Ποινικό",
+        "fields": [
+            {"name":"_case_id","label":"Υπόθεση (συμπληρώνει αυτόματα)","type":"linked","linked_to":"cases","required":False},
+            {"name":"_client_id","label":"Μηνυτής (αν δεν υπάρχει υπόθεση)","type":"linked","linked_to":"clients","required":False},
+            {"name":"client_name","label":"Ονοματεπώνυμο μηνυτή","type":"text","required":True},
+            {"name":"client_father","label":"Πατρώνυμο μηνυτή","type":"text","required":True},
+            {"name":"client_id_number","label":"Αρ. Δ.Α.Τ. μηνυτή","type":"text","required":True},
+            {"name":"client_tax_id","label":"ΑΦΜ μηνυτή","type":"text","required":True},
+            {"name":"client_address","label":"Διεύθυνση μηνυτή","type":"text","required":True},
+            {"name":"client_phone","label":"Τηλέφωνο μηνυτή","type":"text","required":True},
+            {"name":"client_email","label":"Email μηνυτή","type":"text","required":False},
+            {"name":"opponent_name","label":"Ονοματεπώνυμο μηνυομένου","type":"text","required":True},
+            {"name":"opponent_father","label":"Πατρώνυμο μηνυομένου (αν γνωστό)","type":"text","required":False},
+            {"name":"opponent_address","label":"Διεύθυνση μηνυομένου","type":"text","required":True},
+            {"name":"offense","label":"Αδίκημα (π.χ. Απάτη κατ' εξακολούθηση)","type":"text","required":True},
+            {"name":"law_articles","label":"Σχετικά άρθρα νόμου (π.χ. άρθρα 386 ΠΚ)","type":"text","required":True},
+            {"name":"incident_date","label":"Ημερομηνία/περίοδος συμβάντος","type":"text","required":True},
+            {"name":"incident_place","label":"Τόπος συμβάντος","type":"text","required":True},
+            {"name":"description","label":"Ιστορικό – περιγραφή αδικήματος","type":"textarea","required":True},
+            {"name":"damages","label":"Ζημία / βλάβη που υπέστη ο μηνυτής","type":"textarea","required":False},
+            {"name":"evidence","label":"Αποδεικτικά μέσα (έγγραφα, μάρτυρες κ.λπ.)","type":"textarea","required":False},
+            {"name":"court","label":"Εισαγγελία (π.χ. Πλημμελειοδικών Αθηνών)","type":"text","required":True},
+            {"name":"lawyer_name","label":"Ονοματεπώνυμο δικηγόρου","type":"text","required":False},
+            {"name":"lawyer_am","label":"ΑΜ δικηγόρου","type":"text","required":False},
+            {"name":"city","label":"Πόλη κατάθεσης","type":"text","required":True},
+            {"name":"date","label":"Ημερομηνία","type":"date","required":True},
+        ],
+        "template": """ΕΝΩΠΙΟΝ ΤΟΥ κ. ΕΙΣΑΓΓΕΛΕΑ {{court}}
 
-ΕΝΩΠΙΟΝ ΤΟΥ κ. ΕΙΣΑΓΓΕΛΕΑ ΠΛΗΜΜΕΛΕΙΟΔΙΚΩΝ {{court}}
+ΜΗΝΥΣΗ – ΕΓΚΛΗΣΗ
 
-ΤΟΥ/ΤΗΣ {{client_name}}, κατοίκου {{client_address}}, με ΑΦΜ {{client_tax_id}}
+Του/Της: {{client_name}}, του/της {{client_father}}, κατοίκου {{client_address}},
+Δ.Α.Τ. αριθ. {{client_id_number}}, Α.Φ.Μ. {{client_tax_id}},
+Τηλ.: {{client_phone}}, Email: {{client_email}}
+(εφεξής «Μηνυτής/τρια»)
+
+– δια του πληρεξουσίου Δικηγόρου {{lawyer_name}}, Α.Μ. {{lawyer_am}} –
 
 ΚΑΤΑ
 
-ΤΟΥ/ΤΗΣ {{opponent_name}}, κατοίκου {{opponent_address}}
+Του/Της: {{opponent_name}}, του/της {{opponent_father}}, κατοίκου {{opponent_address}}
+(εφεξής «Μηνυόμενος/η»)
 
-* * *
+ΓΙΑ ΤΑ ΑΔΙΚΗΜΑΤΑ: {{offense}}
+({{law_articles}})
+
+Α. ΙΣΤΟΡΙΚΟ
 
 Κύριε Εισαγγελέα,
 
+Τον/τη μηνυόμενο/η γνωρίζω / συνδέομαι / ήλθα σε επαφή μαζί του/της κατά τον/τους χρόνο/χρόνους {{incident_date}} στον/στη {{incident_place}}.
+
 {{description}}
 
-Επειδή τα ανωτέρω αποτελούν αξιόποινες πράξεις, για τους λόγους αυτούς και με τη ρητή επιφύλαξη κάθε νομίμου δικαιώματός μου,
+Β. ΖΗΜΙΑ / ΒΛΑΒΗ
+
+{{damages}}
+
+Γ. ΑΠΟΔΕΙΚΤΙΚΑ ΜΕΣΑ
+
+{{evidence}}
+
+Δ. ΝΟΜΙΚΗ ΒΑΣΗ
+
+Επειδή τα ανωτέρω συμπεριφερόμενα του/της μηνυομένου/ης συνιστούν τα αδικήματα: {{offense}}, κατά τις διατάξεις {{law_articles}}.
+
+Επειδή τα ανωτέρω αποτελούν αξιόποινες πράξεις.
+
+Επειδή υφίσταται ανάγκη άμεσης ποινικής δίωξης για την προστασία των εννόμων συμφερόντων μου.
+
+Ε. ΑΙΤΗΜΑ
+
+Για τους λόγους αυτούς, και με ρητή επιφύλαξη κάθε άλλου νόμιμου δικαιώματός μου (αστική αγωγή, αξίωση αποζημίωσης κ.λπ.),
 
 ΖΗΤΩ
 
-Να ασκηθεί ποινική δίωξη κατά του/της ανωτέρω μηνυομένου/ης για τις αξιόποινες πράξεις που αναφέρονται στο ιστορικό.
+1. Να ασκηθεί ποινική δίωξη κατά του/της ανωτέρω μηνυομένου/ης για τα αναφερόμενα αδικήματα.
+2. Να διαταχθεί η διεξαγωγή προκαταρκτικής εξέτασης και κύριας ανάκρισης.
+3. Να ληφθούν υπόψη τα προσκομιζόμενα αποδεικτικά μέσα.
+4. Να κοινοποιηθεί αντίγραφο της παρούσας στον/στην εγκαλούμενο/η κατ' άρθρο 42 §2 ΚΠΔ.
+5. Να κληθεί ο/η μηνυτής/τρια ως παθών/ούσα στην κύρια ανάκριση.
 
-Να γίνουν δεκτές οι σχετικές αποδείξεις.
+Επιφυλάσσομαι πλήρως των αστικών μου δικαιωμάτων.
 
-{{client_address}}, {{date}}
+{{city}}, {{date}}
 
-Ο/Η Μηνυτής/τρια
+Ο/Η Μηνυτής/τρια                             Ο Πληρεξούσιος Δικηγόρος
 
 
-
-______________________________
-{{client_name}}"""
+_____________________                        _____________________
+{{client_name}}                               {{lawyer_name}}"""
     },
+
+    # ── 4. ΑΙΤΗΣΗ ΑΝΑΣΤΟΛΗΣ ΕΚΤΕΛΕΣΗΣ ────────────────────────────────────────
     "aitisi_anastolis": {
         "id": "aitisi_anastolis",
         "name": "Αίτηση Αναστολής Εκτέλεσης",
-        "description": "Αίτηση αναστολής εκτέλεσης απόφασης",
-        "category": "court",
-        "fields": ["client_name", "client_tax_id", "client_address", "lawyer_name", "court", "case_title", "case_number", "decision_number", "description", "date"],
+        "description": "Αίτηση αναστολής εκτέλεσης απόφασης (άρθρα 912-915 ΚΠολΔ)",
+        "category": "Δικαστικό",
+        "fields": [
+            {"name":"_case_id","label":"Υπόθεση (συμπληρώνει αυτόματα)","type":"linked","linked_to":"cases","required":False},
+            {"name":"client_name","label":"Ονοματεπώνυμο αιτούντος","type":"text","required":True},
+            {"name":"client_father","label":"Πατρώνυμο αιτούντος","type":"text","required":True},
+            {"name":"client_id_number","label":"Αρ. Δ.Α.Τ.","type":"text","required":True},
+            {"name":"client_tax_id","label":"ΑΦΜ αιτούντος","type":"text","required":True},
+            {"name":"client_address","label":"Διεύθυνση αιτούντος","type":"text","required":True},
+            {"name":"lawyer_name","label":"Ονοματεπώνυμο δικηγόρου","type":"text","required":True},
+            {"name":"lawyer_am","label":"ΑΜ δικηγόρου","type":"text","required":True},
+            {"name":"lawyer_dsb","label":"Δικηγορικός Σύλλογος","type":"text","required":True},
+            {"name":"opponent_name","label":"Ονοματεπώνυμο καθ' ου η αίτηση","type":"text","required":True},
+            {"name":"opponent_address","label":"Διεύθυνση καθ' ου","type":"text","required":True},
+            {"name":"court","label":"Δικαστήριο προς το οποίο απευθύνεται","type":"text","required":True},
+            {"name":"decision_number","label":"Αριθμός / Έτος αρ. απόφασης (π.χ. 1234/2025)","type":"text","required":True},
+            {"name":"issuing_court","label":"Δικαστήριο που εξέδωσε την απόφαση","type":"text","required":True},
+            {"name":"case_number","label":"Αριθμός υπόθεσης","type":"text","required":False},
+            {"name":"execution_act","label":"Πράξη εκτέλεσης / επιταγή προς πληρωμή","type":"text","required":False},
+            {"name":"description","label":"Λόγοι αναστολής – ιστορικό","type":"textarea","required":True},
+            {"name":"appeal_details","label":"Στοιχεία έφεσης που ασκήθηκε","type":"text","required":False},
+            {"name":"irreparable_harm","label":"Επικείμενη ανεπανόρθωτη βλάβη αιτούντος","type":"textarea","required":True},
+            {"name":"hearing_date","label":"Ορισθείσα δικάσιμος","type":"date","required":False},
+            {"name":"city","label":"Πόλη κατάθεσης","type":"text","required":True},
+            {"name":"date","label":"Ημερομηνία","type":"date","required":True},
+        ],
         "template": """ΕΝΩΠΙΟΝ ΤΟΥ {{court}}
 
 ΑΙΤΗΣΗ ΑΝΑΣΤΟΛΗΣ ΕΚΤΕΛΕΣΗΣ
-(Άρθρο 912 ΚΠολΔ)
+(κατ' άρθρα 912-915 Κ.Πολ.Δ.)
 
-ΤΟΥ/ΤΗΣ {{client_name}}, κατοίκου {{client_address}}, με ΑΦΜ {{client_tax_id}}, ο/η οποίος/α παρίσταται δια του πληρεξουσίου Δικηγόρου {{lawyer_name}}
+ΑΙΤΩΝ/ΑΙΤΟΥΣΑ: {{client_name}}, του/της {{client_father}}, κάτοικος {{client_address}}, Δ.Α.Τ. {{client_id_number}}, Α.Φ.Μ. {{client_tax_id}}, ο/η οποίος/α παρίσταται δια του πληρεξουσίου Δικηγόρου {{lawyer_name}} (ΑΜ {{lawyer_am}}, Δ.Σ. {{lawyer_dsb}}).
 
-* * *
+ΚΑΘ' ΟΥ Η ΑΙΤΗΣΗ: {{opponent_name}}, κάτοικος {{opponent_address}}.
 
-Με την υπ' αριθ. {{decision_number}} απόφαση, στο πλαίσιο της υπόθεσης «{{case_title}}» (Αρ. {{case_number}}):
+Α. ΙΣΤΟΡΙΚΟ – ΝΟΜΙΚΗ ΒΑΣΗ
+
+Με την υπ' αριθ. {{decision_number}} απόφαση του {{issuing_court}} (Υπόθεση αριθ. {{case_number}}) ο/η καθ' ου απέκτησε τίτλο εκτελεστό εναντίον μου.
+
+Βάσει της εν λόγω αποφάσεως, ο/η καθ' ου επέδωσε {{execution_act}}.
 
 {{description}}
 
-ΓΙΑ ΤΟΥΣ ΛΟΓΟΥΣ ΑΥΤΟΥΣ
+Β. ΑΣΚΗΘΕΙΣΑ ΕΦΕΣΗ
+
+Κατά της ανωτέρω αποφάσεως άσκησα εμπρόθεσμα Έφεση, στοιχεία: {{appeal_details}}.
+Η έφεση έχει ασκηθεί εμπρόθεσμα και νόμιμα και έχει πιθανότητες ευδοκίμησης για τους λόγους που αναπτύσσονται κατωτέρω (άρθρο 912 §1 ΚΠολΔ).
+
+Γ. ΕΠΙΚΕΙΜΕΝΗ ΑΝΕΠΑΝΟΡΘΩΤΗ ΒΛΑΒΗ
+
+{{irreparable_harm}}
+
+Δ. ΝΟΜΙΚΗ ΘΕΜΕΛΙΩΣΗ
+
+Άρθρα 912, 913, 914 §1 Κ.Πολ.Δ.: Η αίτηση αναστολής είναι παραδεκτή εφόσον:
+α) Η εκτέλεση θα επιφέρει στον αιτούντα ανεπανόρθωτη ή δυσχερώς επανορθώσιμη βλάβη, ΚΑΙ
+β) Πιθανολογείται η ευδοκίμηση του ασκηθέντος ένδικου μέσου.
+
+ΕΑΝ ΔΕΝ ΕΧΕ ΟΡΙΣΘΕΙ ΔΙΚΑΣΙΜΟΣ: Ζητείται ο ορισμός της ταχύτερης δυνατής δικασίμου και κοινοποίηση στον καθ' ου.
+
+Ε. ΑΙΤΗΜΑ
+
+Για τους λόγους αυτούς,
 
 ΖΗΤΩ
 
-Να γίνει δεκτή η παρούσα αίτηση.
-Να ανασταλεί η εκτέλεση της ανωτέρω απόφασης.
+1. Να γίνει δεκτή η παρούσα αίτηση.
+2. Να ανασταλεί η εκτέλεση της υπ' αριθ. {{decision_number}} αποφάσεως του {{issuing_court}} μέχρι εκδόσεως αποφάσεως επί της ασκηθείσης Εφέσεως / μέχρι τελεσιδικίας.
+3. (Επικουρικώς) Να ανασταλεί η εκτέλεση υπό τον όρο καταθέσεως εγγύησης, εκτιμωμένης κατά διακριτική ευχέρεια του Δικαστηρίου.
+4. Να καταδικασθεί ο/η καθ' ου στη δικαστική δαπάνη.
 
-{{client_address}}, {{date}}
+Ορισθείσα δικάσιμος: {{hearing_date}}
+
+{{city}}, {{date}}
 
 Ο Πληρεξούσιος Δικηγόρος
 
 
-
-______________________________
+_________________________________
 {{lawyer_name}}"""
-    }
+    },
+
+    # ── 5. ΥΠΕΥΘΥΝΗ ΔΗΛΩΣΗ (Ν. 1599/1986) ────────────────────────────────────
+    "ypeuthinidilosi": {
+        "id": "ypeuthinidilosi",
+        "name": "Υπεύθυνη Δήλωση",
+        "description": "Υπεύθυνη δήλωση κατ' άρθρο 8 Ν. 1599/1986",
+        "category": "Γενικό",
+        "fields": [
+            {"name":"_case_id","label":"Υπόθεση (συμπληρώνει αυτόματα)","type":"linked","linked_to":"cases","required":False},
+            {"name":"_client_id","label":"Εντολέας (αν δεν υπάρχει υπόθεση)","type":"linked","linked_to":"clients","required":False},
+            {"name":"client_name","label":"Ονοματεπώνυμο δηλούντος","type":"text","required":True},
+            {"name":"client_father","label":"Πατρώνυμο","type":"text","required":True},
+            {"name":"client_mother","label":"Μητρώνυμο","type":"text","required":True},
+            {"name":"client_birth_date","label":"Ημερομηνία γέννησης","type":"date","required":True},
+            {"name":"client_birth_place","label":"Τόπος γέννησης","type":"text","required":True},
+            {"name":"client_id_number","label":"Αρ. Δ.Α.Τ. / Διαβατηρίου","type":"text","required":True},
+            {"name":"client_id_issuer","label":"Εκδούσα αρχή Δ.Α.Τ.","type":"text","required":False},
+            {"name":"client_tax_id","label":"ΑΦΜ","type":"text","required":True},
+            {"name":"client_address","label":"Διεύθυνση κατοικίας","type":"text","required":True},
+            {"name":"client_phone","label":"Τηλέφωνο","type":"text","required":True},
+            {"name":"content","label":"Περιεχόμενο δήλωσης","type":"textarea","required":True},
+            {"name":"recipient","label":"Προς (αρχή/υπηρεσία)","type":"text","required":True},
+            {"name":"city","label":"Πόλη","type":"text","required":True},
+            {"name":"date","label":"Ημερομηνία","type":"date","required":True},
+        ],
+        "template": """ΥΠΕΥΘΥΝΗ ΔΗΛΩΣΗ
+(άρθρο 8 Ν. 1599/1986)
+
+Η ακρίβεια των στοιχείων που υποβάλλονται με αυτή τη δήλωση μπορεί να ελεγχθεί με βάση το αρχείο άλλων υπηρεσιών (άρθρο 8 παρ. 4 Ν. 1599/1986).
+
+ΠΡΟΣ: {{recipient}}
+
+Ο/Η κάτωθι υπογράφων/ουσα:
+
+Επώνυμο: ........................   Όνομα: ........................
+Ονοματεπώνυμο: {{client_name}}
+Πατρώνυμο: {{client_father}}           Μητρώνυμο: {{client_mother}}
+Ημερ. γέννησης: {{client_birth_date}}   Τόπος γέννησης: {{client_birth_place}}
+Αρ. Δ.Α.Τ.: {{client_id_number}}       Εκδούσα αρχή: {{client_id_issuer}}
+Α.Φ.Μ.: {{client_tax_id}}
+Διεύθυνση: {{client_address}}
+Τηλέφωνο: {{client_phone}}
+
+ΔΗΛΩΝΩ ΥΠΕΥΘΥΝΩΣ
+
+ότι:
+
+{{content}}
+
+Με πλήρη γνώση των συνεπειών που προβλέπει η κείμενη νομοθεσία για ψευδή δήλωση, ήτοι ποινική δίωξη κατ' άρθρο 22 Ν. 1599/1986 (φυλάκιση τουλάχιστον τριών μηνών).
+
+{{city}}, {{date}}
+
+Ο/Η Δηλών/ούσα
+
+
+_________________________________
+{{client_name}}"""
+    },
+
+    # ── 6. ΣΥΜΒΑΣΗ ΠΑΡΟΧΗΣ ΝΟΜΙΚΩΝ ΥΠΗΡΕΣΙΩΝ ─────────────────────────────────
+    "symbasi_entolis": {
+        "id": "symbasi_entolis",
+        "name": "Σύμβαση Παροχής Νομικών Υπηρεσιών",
+        "description": "Δικηγορική σύμβαση εντολής παροχής νομικών υπηρεσιών (Ν. 4194/2013)",
+        "category": "Γενικό",
+        "fields": [
+            {"name":"_case_id","label":"Υπόθεση (συμπληρώνει αυτόματα)","type":"linked","linked_to":"cases","required":False},
+            {"name":"_client_id","label":"Εντολέας (αν δεν υπάρχει υπόθεση)","type":"linked","linked_to":"clients","required":False},
+            {"name":"lawyer_name","label":"Ονοματεπώνυμο δικηγόρου","type":"text","required":True},
+            {"name":"lawyer_am","label":"ΑΜ δικηγόρου","type":"text","required":True},
+            {"name":"lawyer_dsb","label":"Δικηγορικός Σύλλογος","type":"text","required":True},
+            {"name":"lawyer_address","label":"Διεύθυνση γραφείου","type":"text","required":True},
+            {"name":"lawyer_tax_id","label":"ΑΦΜ δικηγόρου","type":"text","required":True},
+            {"name":"lawyer_doy","label":"ΔΟΥ δικηγόρου","type":"text","required":True},
+            {"name":"client_name","label":"Ονοματεπώνυμο εντολέα","type":"text","required":True},
+            {"name":"client_father","label":"Πατρώνυμο εντολέα","type":"text","required":True},
+            {"name":"client_id_number","label":"Αρ. Δ.Α.Τ. εντολέα","type":"text","required":True},
+            {"name":"client_tax_id","label":"ΑΦΜ εντολέα","type":"text","required":True},
+            {"name":"client_address","label":"Διεύθυνση εντολέα","type":"text","required":True},
+            {"name":"client_phone","label":"Τηλέφωνο εντολέα","type":"text","required":True},
+            {"name":"client_email","label":"Email εντολέα","type":"text","required":False},
+            {"name":"case_description","label":"Περιγραφή νομικής υπόθεσης / αντικείμενο εντολής","type":"textarea","required":True},
+            {"name":"fee_amount","label":"Αμοιβή (€)","type":"text","required":True},
+            {"name":"fee_schedule","label":"Τρόπος / χρόνος καταβολής αμοιβής","type":"text","required":True},
+            {"name":"expenses_note","label":"Δαπάνες (παράβολα, γραμμάτια κ.λπ.)","type":"text","required":False},
+            {"name":"duration","label":"Διάρκεια σύμβασης","type":"text","required":False},
+            {"name":"city","label":"Πόλη σύναψης","type":"text","required":True},
+            {"name":"date","label":"Ημερομηνία","type":"date","required":True},
+        ],
+        "template": """ΣΥΜΒΑΣΗ ΠΑΡΟΧΗΣ ΝΟΜΙΚΩΝ ΥΠΗΡΕΣΙΩΝ
+(κατ' άρθρα 92 επ. Ν. 4194/2013 – Κώδικας Δικηγόρων)
+
+Στην {{city}}, σήμερα {{date}}, μεταξύ των:
+
+Α) ΔΙΚΗΓΟΡΟΥ: {{lawyer_name}}, Δικηγόρου {{lawyer_dsb}} (ΑΜ {{lawyer_am}}), κατοίκου/εδρεύοντος στη διεύθυνση {{lawyer_address}}, με Α.Φ.Μ. {{lawyer_tax_id}}, ΔΟΥ {{lawyer_doy}} (εφεξής «Δικηγόρος»),
+
+ΚΑΙ
+
+Β) ΕΝΤΟΛΕΑ: {{client_name}}, του/της {{client_father}}, κατοίκου {{client_address}}, κατόχου Δ.Α.Τ. αριθ. {{client_id_number}}, Α.Φ.Μ. {{client_tax_id}}, τηλ. {{client_phone}}, email: {{client_email}} (εφεξής «Εντολέας»),
+
+συμφωνούνται και γίνονται αμοιβαία αποδεκτά τα εξής:
+
+ΑΡΘΡΟ 1 – ΑΝΤΙΚΕΙΜΕΝΟ ΕΝΤΟΛΗΣ
+
+Ο Εντολέας αναθέτει στον Δικηγόρο και ο Δικηγόρος αναλαμβάνει να παράσχει τις παρακάτω νομικές υπηρεσίες:
+
+{{case_description}}
+
+ΑΡΘΡΟ 2 – ΑΜΟΙΒΗ
+
+2.1. Η αμοιβή του Δικηγόρου συμφωνείται σε {{fee_amount}} € (πλέον ΦΠΑ 24% βάσει του άρθρου 21 Ν. 4194/2013).
+2.2. Καταβολή: {{fee_schedule}}.
+2.3. Δαπάνες (δικαστικά έξοδα, παράβολα, γραμμάτιο ΕΦΚΑ, τέλη κ.λπ.): {{expenses_note}} — βαρύνουν τον Εντολέα επιπλέον της αμοιβής.
+
+ΑΡΘΡΟ 3 – ΥΠΟΧΡΕΩΣΕΙΣ ΔΙΚΗΓΟΡΟΥ
+
+3.1. Ο Δικηγόρος υποχρεούται να παρέχει τις ανωτέρω υπηρεσίες με επιμέλεια, ειλικρίνεια και εχεμύθεια, σύμφωνα με τον Κώδικα Δικηγόρων (Ν. 4194/2013) και τον Κώδικα Δεοντολογίας.
+3.2. Ο Δικηγόρος θα ενημερώνει τακτικά τον Εντολέα για την πορεία της υπόθεσης.
+3.3. Ο Δικηγόρος τηρεί απόρρητο για κάθε πληροφορία που λαμβάνει εντός της σχέσης εντολής.
+
+ΑΡΘΡΟ 4 – ΥΠΟΧΡΕΩΣΕΙΣ ΕΝΤΟΛΕΑ
+
+4.1. Ο Εντολέας υποχρεούται να καταβάλλει εμπρόθεσμα την αμοιβή και τις δαπάνες.
+4.2. Να παρέχει στον Δικηγόρο όλα τα αναγκαία στοιχεία, έγγραφα και πληροφορίες.
+4.3. Να ειδοποιεί εγκαίρως τον Δικηγόρο για κάθε μεταβολή στοιχείων επικοινωνίας.
+
+ΑΡΘΡΟ 5 – ΔΙΑΡΚΕΙΑ – ΛΥΣΗ
+
+5.1. Η παρούσα ισχύει: {{duration}}.
+5.2. Οποιοσδήποτε συμβαλλόμενος μπορεί να καταγγείλει τη σύμβαση με έγγραφη ειδοποίηση 15 ημερών.
+5.3. Σε περίπτωση καταγγελίας, ο Εντολέας υποχρεούται να καταβάλει αμοιβή αναλογική του πεπραγμένου έργου.
+
+ΑΡΘΡΟ 6 – ΕΦΑΡΜΟΣΤΕΟ ΔΙΚΑΙΟ – ΔΙΚΑΙΟΔΟΣΙΑ
+
+Εφαρμοστέο δίκαιο είναι το Ελληνικό. Για κάθε διαφορά από την παρούσα αρμόδια είναι τα Δικαστήρια της {{city}}.
+
+ΑΡΘΡΟ 7 – ΠΡΟΣΤΑΣΙΑ ΔΕΔΟΜΕΝΩΝ (GDPR)
+
+Τα προσωπικά δεδομένα του Εντολέα χρησιμοποιούνται αποκλειστικά για τους σκοπούς εκτέλεσης της παρούσας σύμβασης, σύμφωνα με τον Κανονισμό (ΕΕ) 2016/679 (GDPR) και τον Ν. 4624/2019.
+
+Η παρούσα σύμβαση έχει συνταχθεί σε δύο (2) αντίτυπα, έλαβε δε ο κάθε συμβαλλόμενος από ένα.
+
+ΟΙ ΣΥΜΒΑΛΛΟΜΕΝΟΙ
+
+
+Ο ΔΙΚΗΓΟΡΟΣ                                  Ο/Η ΕΝΤΟΛΕΑΣ
+
+
+_____________________                        _____________________
+{{lawyer_name}}                               {{client_name}}
+(ΑΜ {{lawyer_am}})"""
+    },
+
+    # ── 7. ΑΓΩΓΗ (ΑΣΤΙΚΗ) ────────────────────────────────────────────────────
+    "agogi": {
+        "id": "agogi",
+        "name": "Αγωγή (Αστική)",
+        "description": "Αστική αγωγή ενώπιον Πρωτοδικείου / Ειρηνοδικείου",
+        "category": "Αστικό",
+        "fields": [
+            {"name":"_case_id","label":"Υπόθεση (συμπληρώνει αυτόματα)","type":"linked","linked_to":"cases","required":False},
+            {"name":"court","label":"Δικαστήριο (π.χ. Πρωτοδικείο Αθηνών)","type":"text","required":True},
+            {"name":"procedure","label":"Διαδικασία (τακτική / ειδικές / ασφαλιστικά)","type":"text","required":True},
+            {"name":"client_name","label":"Ονοματεπώνυμο ενάγοντος","type":"text","required":True},
+            {"name":"client_father","label":"Πατρώνυμο ενάγοντος","type":"text","required":True},
+            {"name":"client_id_number","label":"Αρ. Δ.Α.Τ. ενάγοντος","type":"text","required":True},
+            {"name":"client_tax_id","label":"ΑΦΜ ενάγοντος","type":"text","required":True},
+            {"name":"client_address","label":"Διεύθυνση ενάγοντος","type":"text","required":True},
+            {"name":"opponent_name","label":"Ονοματεπώνυμο εναγομένου","type":"text","required":True},
+            {"name":"opponent_father","label":"Πατρώνυμο εναγομένου","type":"text","required":False},
+            {"name":"opponent_address","label":"Διεύθυνση εναγομένου","type":"text","required":True},
+            {"name":"lawyer_name","label":"Ονοματεπώνυμο δικηγόρου","type":"text","required":True},
+            {"name":"lawyer_am","label":"ΑΜ δικηγόρου","type":"text","required":True},
+            {"name":"cause_of_action","label":"Νομική βάση (αίτιο αγωγής)","type":"text","required":True},
+            {"name":"law_articles","label":"Άρθρα νόμου (ΑΚ, ΚΠολΔ κ.λπ.)","type":"text","required":True},
+            {"name":"facts","label":"Ιστορική βάση – πραγματικά περιστατικά","type":"textarea","required":True},
+            {"name":"claim_amount","label":"Ποσό αγωγής (€)","type":"text","required":False},
+            {"name":"claim_description","label":"Αίτημα αγωγής (αναλυτικά)","type":"textarea","required":True},
+            {"name":"evidence","label":"Αποδεικτικά μέσα","type":"textarea","required":False},
+            {"name":"city","label":"Πόλη κατάθεσης","type":"text","required":True},
+            {"name":"date","label":"Ημερομηνία","type":"date","required":True},
+        ],
+        "template": """ΕΝΩΠΙΟΝ ΤΟΥ {{court}}
+(Διαδικασία: {{procedure}})
+
+Α Γ Ω Γ Η
+
+ΤΟΥ/ΤΗΣ: {{client_name}}, του/της {{client_father}}, κατοίκου {{client_address}}, Δ.Α.Τ. {{client_id_number}}, Α.Φ.Μ. {{client_tax_id}}, ο/η οποίος/α εκπροσωπείται από τον/την Δικηγόρο {{lawyer_name}} (ΑΜ {{lawyer_am}})
+(εφεξής «Ενάγων/ουσα»)
+
+Κ Α Τ Α
+
+ΤΟΥ/ΤΗΣ: {{opponent_name}}, του/της {{opponent_father}}, κατοίκου {{opponent_address}}
+(εφεξής «Εναγόμενος/η»)
+
+Α. ΙΣΤΟΡΙΚΗ ΒΑΣΗ
+
+{{facts}}
+
+Β. ΝΟΜΙΚΗ ΒΑΣΗ
+
+{{cause_of_action}}
+
+Άρθρα: {{law_articles}}
+
+Γ. ΑΠΟΔΕΙΚΤΙΚΑ ΜΕΣΑ
+
+{{evidence}}
+
+Δ. ΑΠΟ ΤΑ ΑΝΩΤΕΡΩ ΠΡΟΚΥΠΤΕΙ ότι:
+– Η αγωγή είναι νόμιμη, ορισμένη και βάσιμη.
+– Αρμόδιο καθ' ύλην και κατά τόπον δικαστήριο είναι το ανωτέρω βάσει των άρθρων 7 επ. και 22 ΚΠολΔ.
+
+ΔΙΑ ΤΑΥΤΑ
+
+ΖΗΤΩ
+
+{{claim_description}}
+
+(Αντικείμενο αγωγής: {{claim_amount}} €)
+
+Να καταδικαστεί ο/η εναγόμενος/η στη δικαστική δαπάνη.
+Να κηρυχθεί η απόφαση προσωρινά εκτελεστή.
+
+{{city}}, {{date}}
+
+Ο Πληρεξούσιος Δικηγόρος
+
+
+_________________________________
+{{lawyer_name}} (ΑΜ {{lawyer_am}})"""
+    },
+
+    # ── 8. ΕΦΕΣΗ ──────────────────────────────────────────────────────────────
+    "efesi": {
+        "id": "efesi",
+        "name": "Έφεση",
+        "description": "Έφεση κατά πρωτόδικης απόφασης (άρθρα 495-524 ΚΠολΔ)",
+        "category": "Δικαστικό",
+        "fields": [
+            {"name":"_case_id","label":"Υπόθεση (συμπληρώνει αυτόματα)","type":"linked","linked_to":"cases","required":False},
+            {"name":"court","label":"Εφετείο (π.χ. Εφετείο Αθηνών)","type":"text","required":True},
+            {"name":"client_name","label":"Ονοματεπώνυμο εκκαλούντος","type":"text","required":True},
+            {"name":"client_father","label":"Πατρώνυμο εκκαλούντος","type":"text","required":True},
+            {"name":"client_id_number","label":"Αρ. Δ.Α.Τ. εκκαλούντος","type":"text","required":True},
+            {"name":"client_tax_id","label":"ΑΦΜ εκκαλούντος","type":"text","required":True},
+            {"name":"client_address","label":"Διεύθυνση εκκαλούντος","type":"text","required":True},
+            {"name":"opponent_name","label":"Ονοματεπώνυμο εφεσίβλητου","type":"text","required":True},
+            {"name":"opponent_address","label":"Διεύθυνση εφεσίβλητου","type":"text","required":True},
+            {"name":"lawyer_name","label":"Ονοματεπώνυμο δικηγόρου","type":"text","required":True},
+            {"name":"lawyer_am","label":"ΑΜ δικηγόρου","type":"text","required":True},
+            {"name":"first_court","label":"Πρωτόδικο Δικαστήριο","type":"text","required":True},
+            {"name":"decision_number","label":"Αριθμός πρωτόδικης απόφασης","type":"text","required":True},
+            {"name":"decision_date","label":"Ημερομηνία πρωτόδικης απόφασης","type":"date","required":True},
+            {"name":"service_date","label":"Ημερομηνία επίδοσης απόφασης","type":"date","required":False},
+            {"name":"grounds","label":"Λόγοι έφεσης (ουσιαστικοί / δικονομικοί)","type":"textarea","required":True},
+            {"name":"prejudiced_party","label":"Ζημία / νομικό σφάλμα πρωτόδικης απόφασης","type":"textarea","required":True},
+            {"name":"city","label":"Πόλη κατάθεσης","type":"text","required":True},
+            {"name":"date","label":"Ημερομηνία","type":"date","required":True},
+        ],
+        "template": """ΕΝΩΠΙΟΝ ΤΟΥ {{court}}
+
+Ε Φ Ε Σ Η
+(κατ' άρθρα 495-524 Κ.Πολ.Δ.)
+
+ΕΚΚΑΛΩΝ/ΟΥΣΑ: {{client_name}}, του/της {{client_father}}, κάτοικος {{client_address}}, Δ.Α.Τ. {{client_id_number}}, Α.Φ.Μ. {{client_tax_id}}, δια του πληρεξουσίου Δικηγόρου {{lawyer_name}} (ΑΜ {{lawyer_am}}).
+
+ΕΦΕΣΙΒΛΗΤΟΣ/Η: {{opponent_name}}, κάτοικος {{opponent_address}}.
+
+ΠΡΟΣΒΑΛΛΟΜΕΝΗ ΑΠΟΦΑΣΗ: Η υπ' αριθ. {{decision_number}} απόφαση του {{first_court}}, ημερομηνίας {{decision_date}}, που επιδόθηκε στις {{service_date}}.
+
+Α. ΠΑΡΑΔΕΚΤΟ ΕΦΕΣΗΣ
+
+Η παρούσα έφεση ασκείται εμπρόθεσμα, εντός της προθεσμίας του άρθρου 518 §1 ΚΠολΔ (30 ημέρες από επίδοση), νόμιμα και παραδεκτά, έχοντας έννομο συμφέρον ο/η εκκαλών/ούσα.
+
+Β. ΛΟΓΟΙ ΕΦΕΣΗΣ
+
+{{grounds}}
+
+Γ. ΝΟΜΙΚΑ ΣΦΑΛΜΑΤΑ ΠΡΩΤΟΔΙΚΗΣ ΑΠΟΦΑΣΗΣ
+
+{{prejudiced_party}}
+
+Δ. ΑΙΤΗΜΑ
+
+Για τους ανωτέρω λόγους,
+
+ΖΗΤΩ
+
+1. Να γίνει τυπικά και ουσιαστικά δεκτή η παρούσα Έφεση.
+2. Να εξαφανιστεί η προσβαλλόμενη υπ' αριθ. {{decision_number}} απόφαση.
+3. Να γίνει δεκτή η αγωγή / να απορριφθεί η αγωγή (κατά περίπτωση).
+4. Να καταδικαστεί ο/η εφεσίβλητος/η στη δικαστική δαπάνη αμφοτέρων των βαθμών.
+
+Επισυνάπτεται:
+– Αντίγραφο της προσβαλλόμενης απόφασης
+– Αποδεικτικό επίδοσης
+– Παράβολο άρθρου 495 §3 ΚΠολΔ
+
+{{city}}, {{date}}
+
+Ο Πληρεξούσιος Δικηγόρος
+
+
+_________________________________
+{{lawyer_name}} (ΑΜ {{lawyer_am}})"""
+    },
+
+    # ── 9. ΔΗΛΩΣΗ ΠΟΙΝΙΚΗΣ ΔΙΑΔΙΚΑΣΙΑΣ (ΚΑΤΗΓΟΡΟΥΜΕΝΟΣ) ───────────────────────
+    "dilosi_katigoro": {
+        "id": "dilosi_katigoro",
+        "name": "Δήλωση Παράστασης Πολιτικής Αγωγής",
+        "description": "Δήλωση παράστασης πολιτικής αγωγής ενώπιον ποινικού δικαστηρίου (άρθρο 82 ΚΠΔ)",
+        "category": "Ποινικό",
+        "fields": [
+            {"name":"_case_id","label":"Υπόθεση (συμπληρώνει αυτόματα)","type":"linked","linked_to":"cases","required":False},
+            {"name":"court","label":"Ποινικό Δικαστήριο","type":"text","required":True},
+            {"name":"hearing_date","label":"Δικάσιμος","type":"date","required":True},
+            {"name":"case_number","label":"Αριθμός δικογραφίας / εγκλήματος","type":"text","required":False},
+            {"name":"client_name","label":"Ονοματεπώνυμο παθόντος (πολιτικώς ενάγοντος)","type":"text","required":True},
+            {"name":"client_father","label":"Πατρώνυμο","type":"text","required":True},
+            {"name":"client_id_number","label":"Αρ. Δ.Α.Τ.","type":"text","required":True},
+            {"name":"client_tax_id","label":"ΑΦΜ","type":"text","required":True},
+            {"name":"client_address","label":"Διεύθυνση","type":"text","required":True},
+            {"name":"lawyer_name","label":"Ονοματεπώνυμο δικηγόρου","type":"text","required":True},
+            {"name":"lawyer_am","label":"ΑΜ δικηγόρου","type":"text","required":True},
+            {"name":"accused_name","label":"Ονοματεπώνυμο κατηγορουμένου","type":"text","required":True},
+            {"name":"offense","label":"Αδίκημα για το οποίο δικάζεται","type":"text","required":True},
+            {"name":"claim_amount","label":"Χρηματική αξίωση (€) — συμβολικό ή ποσό","type":"text","required":True},
+            {"name":"description","label":"Συνοπτική περιγραφή ζημίας","type":"textarea","required":True},
+            {"name":"city","label":"Πόλη","type":"text","required":True},
+            {"name":"date","label":"Ημερομηνία","type":"date","required":True},
+        ],
+        "template": """ΕΝΩΠΙΟΝ ΤΟΥ {{court}}
+(Δικάσιμος: {{hearing_date}} — Αρ. δικογραφίας: {{case_number}})
+
+ΔΗΛΩΣΗ ΠΑΡΑΣΤΑΣΗΣ ΠΟΛΙΤΙΚΗΣ ΑΓΩΓΗΣ
+(άρθρα 82-89 Κ.Π.Δ.)
+
+Του/Της: {{client_name}}, του/της {{client_father}}, κατοίκου {{client_address}}, Δ.Α.Τ. {{client_id_number}}, Α.Φ.Μ. {{client_tax_id}}, ο/η οποίος/α εκπροσωπείται από τον/την Δικηγόρο {{lawyer_name}} (ΑΜ {{lawyer_am}}).
+(εφεξής «Πολιτικώς Ενάγων/ούσα»)
+
+ΚΑΤΑ
+
+Του/Της κατηγορουμένου/ης: {{accused_name}}, κατηγορουμένου/ης για το αδίκημα: {{offense}}.
+
+ΔΗΛΩΝΩ
+
+ότι παρίσταμαι ως πολιτικώς ενάγων/ούσα στην παρούσα ποινική δίκη, για να αξιώσω εύλογη χρηματική ικανοποίηση λόγω ηθικής βλάβης / περιουσιακής ζημίας.
+
+Α. ΠΕΡΙΓΡΑΦΗ ΖΗΜΙΑΣ
+
+{{description}}
+
+Β. ΑΞΙΩΣΗ
+
+Ζητώ χρηματική ικανοποίηση ποσού {{claim_amount}} €, καθώς και κάθε άλλη νόμιμη αποζημίωση.
+
+Γ. ΝΟΜΙΚΗ ΒΑΣΗ
+
+Άρθρα 82, 83 Κ.Π.Δ., 914, 932 ΑΚ.
+
+Δ. ΑΙΤΗΜΑ
+
+Να γίνει δεκτή η παρούσα δήλωση παράστασης πολιτικής αγωγής.
+Να υποχρεωθεί ο/η κατηγορούμενος/η να μου καταβάλει ποσό {{claim_amount}} €.
+
+{{city}}, {{date}}
+
+Ο/Η Πολιτικώς Ενάγων/ούσα           Ο Πληρεξούσιος Δικηγόρος
+
+
+_____________________                _____________________
+{{client_name}}                       {{lawyer_name}}"""
+    },
 }
 
 @app.get("/api/templates")
@@ -2606,49 +4168,173 @@ async def get_template(template_id: str, user=Depends(get_current_user)):
     return TEMPLATES[template_id]
 
 @app.post("/api/templates/{template_id}/fill")
-async def fill_template(template_id: str, case_id: Optional[str] = None, user=Depends(get_current_user)):
-    """Auto-fill template with case/client data. Returns pre-filled fields."""
+async def fill_template(
+    template_id: str,
+    case_id: Optional[str] = None,
+    client_id: Optional[str] = None,
+    user=Depends(get_current_user)
+):
+    """Auto-fill template fields from case/client data."""
     if template_id not in TEMPLATES: raise HTTPException(404, "Πρότυπο δεν βρέθηκε")
     tmpl = TEMPLATES[template_id]
-    data = {"date": datetime.utcnow().strftime("%d/%m/%Y"), "lawyer_name": user.get("name", "")}
+    data: dict = {"date": datetime.utcnow().strftime("%d/%m/%Y")}
 
+    # Pull office/lawyer settings for lawyer fields
+    settings = await db.settings.find_one({"_id": "office"}) or {}
+    if settings:
+        data["lawyer_name"]    = settings.get("lawyer_name") or user.get("name", "")
+        data["lawyer_am"]      = settings.get("lawyer_am", "")
+        data["lawyer_dsb"]     = settings.get("lawyer_dsb", "")
+        data["lawyer_address"] = settings.get("address", "")
+        data["lawyer_tax_id"]  = settings.get("afm", "")
+        data["lawyer_doy"]     = settings.get("doy", "")
+        data["city"]           = settings.get("city", "")
+    else:
+        data["lawyer_name"] = user.get("name", "")
+
+    def _fill_client(cl: dict):
+        data["client_name"]    = cl.get("full_name") or cl.get("name", "")
+        data["client_tax_id"]  = cl.get("afm") or cl.get("tax_id", "")
+        data["client_address"] = cl.get("address", "")
+        data["client_phone"]   = cl.get("phone", "")
+        data["client_email"]   = cl.get("email", "")
+
+    # Case-based auto-fill
     if case_id:
         case = await db.cases.find_one({"_id": make_id(case_id)})
         if case:
-            data["case_title"] = case.get("title", "")
-            data["case_number"] = case.get("case_number", "")
-            data["court"] = case.get("court", "")
-            # Get client
-            if case.get("client_id"):
-                cl = await db.clients.find_one({"_id": make_id(case["client_id"])})
+            data["case_title"]       = case.get("title", "")
+            data["case_description"] = case.get("description") or case.get("title", "")
+            data["case_number"]      = case.get("case_number", "")
+            data["court"]            = case.get("court", "")
+            data["offense"]          = case.get("offense", "")
+            data["law_articles"]     = case.get("law_articles", "")
+            # Client(s) linked to case
+            cid = case.get("client_id") or (case.get("client_ids") or [None])[0]
+            if cid:
+                cl = await db.clients.find_one({"_id": make_id(cid)})
                 if cl:
-                    data["client_name"] = cl.get("name", "")
-                    data["client_tax_id"] = cl.get("tax_id", "")
-                    data["client_address"] = cl.get("address", "")
-            # Get lawyer
+                    _fill_client(cl)
+            # Assigned lawyer (override generic setting)
             if case.get("assigned_lawyer_id"):
                 lawyer = await db.users.find_one({"_id": make_id(case["assigned_lawyer_id"])})
-                if lawyer: data["lawyer_name"] = lawyer.get("name", "")
-            # Get opponent from parties
-            parties = await db.case_parties.find({"case_id": case_id, "party_role": "opponent"}).to_list(1)
+                if lawyer:
+                    data["lawyer_name"] = lawyer.get("full_name") or lawyer.get("name", "")
+            # Opponent from parties collection
+            try:
+                parties = await db.case_parties.find(
+                    {"case_id": case_id, "party_role": {"$in": ["opponent", "καθ' ου", "εναγόμενος", "κατηγορούμενος"]}}
+                ).to_list(1)
+            except Exception:
+                parties = []
             if parties:
-                data["opponent_name"] = parties[0].get("name", "")
+                data["opponent_name"]    = parties[0].get("name", "")
                 data["opponent_address"] = parties[0].get("address", "")
+                data["accused_name"]     = parties[0].get("name", "")
+
+    # Client-only auto-fill (when no case selected)
+    elif client_id:
+        cl = await db.clients.find_one({"_id": make_id(client_id)})
+        if cl:
+            _fill_client(cl)
 
     return {"template": tmpl, "auto_filled": data}
 
 @app.post("/api/templates/{template_id}/generate")
-async def generate_document(template_id: str, fields: dict, user=Depends(get_current_user)):
-    """Generate document from template with provided field values."""
-    if template_id not in TEMPLATES: raise HTTPException(404, "Πρότυπο δεν βρέθηκε")
+async def generate_document(template_id: str, body: dict, user=Depends(get_current_user)):
+    """Generate a proper .docx file from template with provided field values."""
+    if template_id not in TEMPLATES:
+        raise HTTPException(404, "Πρότυπο δεν βρέθηκε")
     tmpl = TEMPLATES[template_id]
-    text = tmpl["template"]
+
+    # Frontend sends { fields: {...} } — unwrap if needed
+    fields: dict = body.get("fields", body)
+
+    # Fill placeholders (skip _-prefixed meta fields like _case_id, _client_id)
+    text: str = tmpl["template"]
     for key, value in fields.items():
-        text = text.replace("{{" + key + "}}", str(value or "________"))
-    # Replace any remaining unfilled placeholders
-    import re as regex_module
-    text = regex_module.sub(r"\{\{[^}]+\}\}", "________", text)
-    return {"document_text": text, "template_name": tmpl["name"]}
+        if key.startswith("_"):
+            continue
+        text = text.replace("{{" + key + "}}", str(value) if value else "________")
+    text = re.sub(r"\{\{[^}]+\}\}", "________", text)
+
+    # Build .docx in memory using python-docx
+    try:
+        from docx import Document as DocxDocument
+        from docx.shared import Pt, Cm
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        import io
+
+        doc = DocxDocument()
+
+        # Page margins (Greek legal standard: ~2.5 cm)
+        for section in doc.sections:
+            section.top_margin    = Cm(2.5)
+            section.bottom_margin = Cm(2.5)
+            section.left_margin   = Cm(3.0)
+            section.right_margin  = Cm(2.5)
+
+        # Default font
+        style = doc.styles["Normal"]
+        font  = style.font
+        font.name = "Times New Roman"
+        font.size = Pt(12)
+
+        lines = text.split("\n")
+        for line in lines:
+            stripped = line.strip()
+            p = doc.add_paragraph()
+
+            # Detect title / heading lines (all-caps, short, centred)
+            is_title = (
+                stripped.isupper()
+                and len(stripped) > 3
+                and len(stripped) < 80
+                and not stripped.startswith("–")
+                and not stripped.startswith("-")
+            )
+            if is_title:
+                run = p.add_run(stripped)
+                run.bold = True
+                run.font.size = Pt(13)
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            elif stripped.startswith("_____"):
+                run = p.add_run(line)
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            elif stripped == "":
+                p.paragraph_format.space_after = Pt(4)
+            else:
+                run = p.add_run(line)
+                run.font.size = Pt(12)
+                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+
+        # RFC 5987 encoding for non-ASCII filenames
+        from urllib.parse import quote
+        name_ascii  = tmpl["id"]  # always safe ASCII
+        name_utf8   = quote(tmpl["name"].replace(" ", "_") + ".docx", safe="")
+        disposition = f"attachment; filename=\"{name_ascii}.docx\"; filename*=UTF-8''{name_utf8}"
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": disposition},
+        )
+
+    except ImportError:
+        import io
+        from urllib.parse import quote
+        buf = io.BytesIO(text.encode("utf-8"))
+        buf.seek(0)
+        name_utf8   = quote(tmpl["name"].replace(" ", "_") + ".txt", safe="")
+        disposition = f"attachment; filename=\"{tmpl['id']}.txt\"; filename*=UTF-8''{name_utf8}"
+        return StreamingResponse(
+            buf,
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": disposition},
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SETTINGS (Office info, team, notifications)
@@ -3308,6 +4994,7 @@ async def get_case_hearings(case_id: str, user=Depends(get_current_user)):
 
 @app.post("/api/hearings", status_code=201)
 async def create_hearing(req: HearingRequest, user=Depends(get_current_user)):
+    await _check_payment_gate(req.case_id, f"Δικάσιμος: {req.court}")
     doc = req.dict()
     doc["created_at"] = datetime.utcnow()
     doc["created_by"] = user["id"]
@@ -3351,6 +5038,12 @@ async def send_email(req: EmailSendRequest, user=Depends(get_current_user)):
         "sent_by": user["id"], "sent_at": datetime.utcnow(),
         "invoice_id": req.invoice_id, "status": "pending"
     }
+    # Sender identity: noreply address + sending user's name + reply-to their personal email
+    noreply_addr  = os.getenv("SMTP_FROM", from_email)
+    sender_name   = user.get("full_name") or user.get("name") or FIRM_DISPLAY_NAME
+    sender_email  = user.get("email") or ""
+    display_from  = f"{sender_name} — {FIRM_DISPLAY_NAME} <{noreply_addr}>"
+
     if not smtp_host or not smtp_user:
         log_doc["status"] = "placeholder_logged"
         await db.email_logs.insert_one(log_doc)
@@ -3359,8 +5052,10 @@ async def send_email(req: EmailSendRequest, user=Depends(get_current_user)):
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = req.subject
-        msg["From"] = f"{FIRM_DISPLAY_NAME} <{from_email}>"
-        msg["To"] = f"{req.to_name or ''} <{req.to_email}>"
+        msg["From"]    = display_from
+        msg["To"]      = f"{req.to_name or ''} <{req.to_email}>"
+        if sender_email:
+            msg["Reply-To"] = sender_email
         if req.body_text:
             msg.attach(MIMEText(req.body_text, "plain", "utf-8"))
         msg.attach(MIMEText(req.body_html, "html", "utf-8"))
@@ -3368,7 +5063,7 @@ async def send_email(req: EmailSendRequest, user=Depends(get_current_user)):
             srv.ehlo()
             srv.starttls()
             srv.login(smtp_user, smtp_pass)
-            srv.sendmail(from_email, req.to_email, msg.as_string())
+            srv.sendmail(noreply_addr, req.to_email, msg.as_string())
         log_doc["status"] = "sent"
         await db.email_logs.insert_one(log_doc)
         await audit("EMAIL_SENT", user["id"], "email", req.to_email)
@@ -3882,3 +5577,1078 @@ async def get_app_config_v1(user: Optional[Dict] = None):
         },
         "websocket_url": "ws://localhost:8000/ws"
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GREEK CALENDAR & DEADLINE ENGINE
+# ═══════════════════════════════════════════════════════════════════════════
+
+from datetime import date as _date_t
+
+def _orthodox_easter(year: int) -> _date_t:
+    """Compute Greek Orthodox Easter (Julian → Gregorian +13 days)."""
+    c = year % 19
+    d = (19 * c + 15) % 30
+    e = (2 * (year % 4) + 4 * (year % 7) - d + 34) % 7
+    month = (d + e + 114) // 31
+    day = (d + e + 114) % 31 + 1
+    return _date_t(year, month, day) + timedelta(days=13)
+
+def _greek_holidays_set(year: int) -> set:
+    e = _orthodox_easter(year)
+    return {
+        _date_t(year, 1, 1),   # Πρωτοχρονιά
+        _date_t(year, 1, 6),   # Θεοφάνεια
+        e - timedelta(48),      # Καθαρά Δευτέρα
+        _date_t(year, 3, 25),  # 25η Μαρτίου
+        e - timedelta(2),       # Μεγάλη Παρασκευή
+        e,                      # Κυριακή Πάσχα
+        e + timedelta(1),       # Δευτέρα Πάσχα
+        _date_t(year, 5, 1),   # Εργατική Πρωτομαγιά
+        e + timedelta(50),      # Αγίου Πνεύματος
+        _date_t(year, 8, 15),  # Κοίμηση Θεοτόκου
+        _date_t(year, 10, 28), # 28η Οκτωβρίου
+        _date_t(year, 12, 25), # Χριστούγεννα
+        _date_t(year, 12, 26), # Σύναξη Θεοτόκου
+    }
+
+def _greek_holidays_list(year: int) -> list:
+    e = _orthodox_easter(year)
+    return [
+        {"date": _date_t(year, 1, 1).isoformat(),  "name": "Πρωτοχρονιά"},
+        {"date": _date_t(year, 1, 6).isoformat(),  "name": "Θεοφάνεια"},
+        {"date": (e - timedelta(48)).isoformat(),   "name": "Καθαρά Δευτέρα"},
+        {"date": _date_t(year, 3, 25).isoformat(), "name": "25η Μαρτίου"},
+        {"date": (e - timedelta(2)).isoformat(),    "name": "Μεγάλη Παρασκευή"},
+        {"date": e.isoformat(),                     "name": "Κυριακή του Πάσχα"},
+        {"date": (e + timedelta(1)).isoformat(),    "name": "Δευτέρα του Πάσχα"},
+        {"date": _date_t(year, 5, 1).isoformat(),  "name": "Εργατική Πρωτομαγιά"},
+        {"date": (e + timedelta(50)).isoformat(),   "name": "Αγίου Πνεύματος"},
+        {"date": _date_t(year, 8, 15).isoformat(), "name": "Κοίμηση Θεοτόκου"},
+        {"date": _date_t(year, 10, 28).isoformat(),"name": "28η Οκτωβρίου"},
+        {"date": _date_t(year, 12, 25).isoformat(),"name": "Χριστούγεννα"},
+        {"date": _date_t(year, 12, 26).isoformat(),"name": "Σύναξη Θεοτόκου"},
+    ]
+
+def _court_vacations_list(year: int) -> list:
+    e = _orthodox_easter(year)
+    next_y = year + 1 if year < 9999 else year
+    return [
+        {
+            "start": (e - timedelta(4)).isoformat(),
+            "end":   (e + timedelta(8)).isoformat(),
+            "name":  "Πασχαλινές Δικαστικές Διακοπές",
+            "type":  "easter",
+        },
+        {
+            "start": _date_t(year, 7, 1).isoformat(),
+            "end":   _date_t(year, 9, 15).isoformat(),
+            "name":  "Θερινές Δικαστικές Διακοπές",
+            "type":  "summer",
+        },
+        {
+            "start": _date_t(year, 12, 24).isoformat(),
+            "end":   _date_t(next_y, 1, 6).isoformat(),
+            "name":  "Χριστουγεννιάτικες Δικαστικές Διακοπές",
+            "type":  "christmas",
+        },
+    ]
+
+def _in_vacation(d: _date_t, vacations: list) -> bool:
+    for v in vacations:
+        if _date_t.fromisoformat(v["start"]) <= d <= _date_t.fromisoformat(v["end"]):
+            return True
+    return False
+
+def _is_working_day(d: _date_t, holidays: set) -> bool:
+    return d.weekday() < 5 and d not in holidays
+
+def _next_working_day(d: _date_t, holidays: set) -> _date_t:
+    while not _is_working_day(d, holidays):
+        d += timedelta(days=1)
+    return d
+
+def _compute_deadline(start_iso: str, days: int, suspended: bool) -> dict:
+    start = _date_t.fromisoformat(start_iso)
+    # Collect holidays/vacations for up to 3 years ahead
+    all_holidays: set = set()
+    all_vacations: list = []
+    for yr in range(start.year, start.year + 4):
+        all_holidays |= _greek_holidays_set(yr)
+        all_vacations += _court_vacations_list(yr)
+
+    # ΚΠολΔ 144: counting starts from day AFTER the trigger event
+    current = start + timedelta(days=1)
+    remaining = days
+    suspended_days = 0
+
+    while remaining > 0:
+        if suspended and _in_vacation(current, all_vacations):
+            suspended_days += 1  # clock pauses during recess
+        else:
+            remaining -= 1
+        if remaining > 0:
+            current += timedelta(days=1)
+
+    original = current
+    # ΚΠολΔ 145: if last day is weekend/holiday, extend to next working day
+    final = _next_working_day(current, all_holidays)
+
+    # Identify which vacations overlap
+    overlapping = [v["name"] for v in all_vacations
+                   if _date_t.fromisoformat(v["start"]) <= final
+                   and _date_t.fromisoformat(v["end"]) >= start]
+
+    return {
+        "start_date": start_iso,
+        "deadline_date": final.isoformat(),
+        "original_date": original.isoformat(),
+        "extended_due_to_holiday": final != original,
+        "suspended_days": suspended_days,
+        "total_calendar_days": (final - start).days,
+        "overlapping_vacations": overlapping,
+    }
+
+# ── Deadline catalog ────────────────────────────────────────────────────────
+DEADLINE_CATALOG = {
+    "ΚΠολΔ": [
+        {"id": "efesi",        "label": "Έφεση (ΚΠολΔ 518)",                   "days": 30,   "suspended": True,  "note": "30 ημέρες από επίδοση απόφασης. Αναστέλλεται κατά δικαστικές διακοπές (ΚΠολΔ 147)."},
+        {"id": "anairesi",     "label": "Αναίρεση (ΚΠολΔ 564)",                "days": 60,   "suspended": True,  "note": "60 ημέρες. Αναστέλλεται κατά διακοπές."},
+        {"id": "tritanakopi",  "label": "Τριτανακοπή (ΚΠολΔ 586)",             "days": 60,   "suspended": True,  "note": "60 ημέρες από δημοσίευση απόφασης."},
+        {"id": "anakopi_erim", "label": "Ανακοπή Ερημοδικίας (ΚΠολΔ 501)",    "days": 15,   "suspended": True,  "note": "15 ημέρες από επίδοση ερήμην απόφασης. Αναστέλλεται."},
+        {"id": "anakopi_ektl", "label": "Ανακοπή κατ' Εκτέλεσης (ΚΠολΔ 934)", "days": 45,   "suspended": False, "note": "45 ημέρες από επίδοση. ΔΕΝ αναστέλλεται κατά διακοπές."},
+        {"id": "antifesi",     "label": "Αντέφεση (ΚΠολΔ 523)",                "days": 30,   "suspended": True,  "note": "Ίδια προθεσμία με έφεση."},
+        {"id": "prosthiki",    "label": "Προσθήκη-Αντίκρουση (ΚΠολΔ 237§2)",  "days": 100,  "suspended": True,  "note": "100 ημέρες από κατάθεση αγωγής."},
+        {"id": "efesi_erim",   "label": "Έφεση κατά Ερήμην (ΚΠολΔ 501§2)",    "days": 15,   "suspended": True,  "note": "15 ημέρες από επίδοση."},
+        {"id": "anakopi_dpl",  "label": "Ανακοπή Διαταγής Πληρωμής (ΚΠολΔ 632)", "days": 15, "suspended": True, "note": "15 εργάσιμες ημέρες από επίδοση."},
+        {"id": "klitefsi",     "label": "Κλήτευση πριν δικάσιμο (ΚΠολΔ 228)", "days": 60,   "suspended": False, "note": "Τουλάχιστον 60 ημέρες πριν δικάσιμο."},
+    ],
+    "ΚΠΔ": [
+        {"id": "efesi_kpd",    "label": "Έφεση (ΚΠΔ 474)",                     "days": 10,   "suspended": False, "note": "10 ημέρες. ΔΕΝ αναστέλλεται. Υπέρ κατηγορουμένου από δημοσίευση."},
+        {"id": "anairesi_kpd", "label": "Αναίρεση (ΚΠΔ 509)",                  "days": 30,   "suspended": False, "note": "30 ημέρες. ΔΕΝ αναστέλλεται."},
+        {"id": "anakopi_kpd",  "label": "Ανακοπή Ερημοδικίας (ΚΠΔ 341)",      "days": 5,    "suspended": False, "note": "5 ημέρες από επίδοση ερήμην."},
+        {"id": "prosfygi_kpd", "label": "Προσφυγή (ΚΠΔ 464)",                  "days": 10,   "suspended": False, "note": "10 ημέρες."},
+    ],
+    "ΑΚ": [
+        {"id": "p20",  "label": "Γενική Παραγραφή 20ετής (ΑΚ 249)",  "days": 7300, "suspended": False, "note": "20 χρόνια γενική παραγραφή."},
+        {"id": "p5",   "label": "5ετής Παραγραφή (ΑΚ 250)",          "days": 1825, "suspended": False, "note": "5 χρόνια: ενοίκια, τόκοι, μισθοί."},
+        {"id": "p3",   "label": "3ετής Παραγραφή (ΑΚ 867)",          "days": 1095, "suspended": False, "note": "3 χρόνια: μισθώματα, αποζημίωση εργολάβου."},
+        {"id": "p2",   "label": "2ετής Παραγραφή (ΑΚ 937)",          "days": 730,  "suspended": False, "note": "2 χρόνια από γνώση ζημίας (αδικοπραξία)."},
+        {"id": "p1",   "label": "1ετής Παραγραφή (ΑΚ 682)",          "days": 365,  "suspended": False, "note": "1 χρόνο."},
+    ],
+    "ΔΔ": [
+        {"id": "prosfygi_dd",   "label": "Προσφυγή (ΚΔΔ 66)",            "days": 60, "suspended": False, "note": "60 ημέρες από κοινοποίηση πράξης."},
+        {"id": "efesi_dd",      "label": "Έφεση Διοικητικού (ΚΔΔ 92)",   "days": 60, "suspended": False, "note": "60 ημέρες από επίδοση απόφασης."},
+        {"id": "aithisi_akyr",  "label": "Αίτηση Ακύρωσης (ΠΔ 18/89)",   "days": 60, "suspended": False, "note": "60 ημέρες από δημοσίευση/κοινοποίηση."},
+        {"id": "anakopi_fte",   "label": "Ανακοπή κατά ΦΤΕ",             "days": 30, "suspended": False, "note": "30 ημέρες."},
+    ],
+}
+
+
+@app.get("/api/calendar/holidays")
+async def get_holidays_api(year: int = Query(default=None), user: Dict = Depends(get_current_user)):
+    if year is None:
+        year = datetime.utcnow().year
+    return {
+        "year": year,
+        "holidays": _greek_holidays_list(year),
+        "easter": _orthodox_easter(year).isoformat(),
+    }
+
+
+@app.get("/api/calendar/vacations")
+async def get_court_vacations_api(year: int = Query(default=None), user: Dict = Depends(get_current_user)):
+    if year is None:
+        year = datetime.utcnow().year
+    return {
+        "year": year,
+        "vacations": _court_vacations_list(year),
+    }
+
+
+@app.get("/api/calendar/deadline-types")
+async def get_deadline_types(user: Dict = Depends(get_current_user)):
+    return DEADLINE_CATALOG
+
+
+class DeadlineCalcRequest(BaseModel):
+    start_date: str          # ISO date string YYYY-MM-DD
+    law_code: str            # e.g. "ΚΠολΔ"
+    deadline_type_id: str    # e.g. "efesi"
+    notes: Optional[str] = None
+
+
+@app.post("/api/calendar/calculate")
+async def calculate_deadline_api(req: DeadlineCalcRequest, user: Dict = Depends(get_current_user)):
+    catalog = DEADLINE_CATALOG.get(req.law_code)
+    if not catalog:
+        raise HTTPException(400, f"Άγνωστος κωδικός νόμου: {req.law_code}")
+    dtype = next((d for d in catalog if d["id"] == req.deadline_type_id), None)
+    if not dtype:
+        raise HTTPException(400, f"Άγνωστος τύπος προθεσμίας: {req.deadline_type_id}")
+
+    result = _compute_deadline(req.start_date, dtype["days"], dtype["suspended"])
+    return {
+        **result,
+        "law_code": req.law_code,
+        "deadline_type": dtype["label"],
+        "nominal_days": dtype["days"],
+        "suspended_during_recesses": dtype["suspended"],
+        "legal_note": dtype["note"],
+        "user_notes": req.notes or "",
+    }
+
+
+@app.get("/api/calendar/week")
+async def get_week_data(date: str = Query(default=None), user: Dict = Depends(get_current_user)):
+    """Return all hearings + deadlines for the week containing the given date."""
+    if date is None:
+        date = datetime.utcnow().date().isoformat()
+    try:
+        pivot = _date_t.fromisoformat(date)
+    except ValueError:
+        raise HTTPException(400, "Μη έγκυρη ημερομηνία")
+
+    # Monday of that week
+    monday = pivot - timedelta(days=pivot.weekday())
+    sunday = monday + timedelta(days=6)
+
+    # Collect hearings
+    hearings_cursor = db.hearings.find({
+        "hearing_date": {
+            "$gte": datetime.combine(monday, datetime.min.time()),
+            "$lte": datetime.combine(sunday, datetime.max.time()),
+        }
+    })
+    hearings = []
+    async for h in hearings_cursor:
+        h["_id"] = str(h["_id"])
+        hearings.append(h)
+
+    # Collect deadlines
+    deadlines_cursor = db.deadlines.find({
+        "$or": [
+            {"due_date": {"$gte": monday.isoformat(), "$lte": sunday.isoformat()}},
+            {"date": {
+                "$gte": datetime.combine(monday, datetime.min.time()),
+                "$lte": datetime.combine(sunday, datetime.max.time()),
+            }},
+        ]
+    })
+    deadlines = []
+    async for d in deadlines_cursor:
+        d["_id"] = str(d["_id"])
+        deadlines.append(d)
+
+    # Enrich with case titles
+    case_ids = list({h.get("case_id") for h in hearings} | {d.get("case_id") for d in deadlines} - {None})
+    case_map = {}
+    for cid in case_ids:
+        try:
+            c = await db.cases.find_one({"_id": ObjectId(cid)})
+            if c:
+                case_map[cid] = c.get("title") or c.get("offense") or "—"
+        except Exception:
+            pass
+
+    for h in hearings:
+        h["case_title"] = case_map.get(h.get("case_id"), "—")
+        h["day"] = datetime.fromisoformat(str(h["hearing_date"]).replace("Z","")).date().isoformat() if h.get("hearing_date") else None
+    for d in deadlines:
+        d["case_title"] = case_map.get(d.get("case_id"), "—")
+        d["day"] = d.get("due_date") or (str(d["date"])[:10] if d.get("date") else None)
+
+    return {
+        "week_start": monday.isoformat(),
+        "week_end": sunday.isoformat(),
+        "hearings": hearings,
+        "deadlines": deadlines,
+        "holidays": _greek_holidays_list(monday.year),
+        "vacations": _court_vacations_list(monday.year),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ΠΙΝΑΚΕΙΑ — Court Schedule Management
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/pinakia/upload")
+async def upload_pinakio(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Upload and process a court schedule document (PDF/DOCX/XLSX/image)."""
+    file_bytes = await file.read()
+    media_type = file.content_type or "application/pdf"
+    filename = file.filename or "pinakio"
+
+    # Extract hearings via Claude
+    try:
+        extracted = extract_pinakio(ANTHROPIC_API_KEY, file_bytes, media_type, MODEL_CHAT)
+    except Exception as e:
+        logger.error(f"Pinakio extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Αποτυχία εξαγωγής: {str(e)}")
+
+    hearings_raw = extracted.get("hearings") or []
+    hearing_date = extracted.get("hearing_date") or datetime.now(timezone.utc).date().isoformat()
+    court_name = extracted.get("court_name") or "Άγνωστο Δικαστήριο"
+
+    # Match against open cases
+    hearings = await match_pinakio_hearings(db, hearings_raw)
+    match_count = sum(1 for h in hearings if h.get("matched_case_id"))
+
+    doc = {
+        "court_name": court_name,
+        "hearing_date": hearing_date,
+        "file_name": filename,
+        "media_type": media_type,
+        "uploaded_at": datetime.now(timezone.utc),
+        "uploaded_by": current_user.get("email", "unknown"),
+        "source": "web",
+        "hearings": hearings,
+        "hearing_count": len(hearings),
+        "match_count": match_count,
+    }
+    result = await db.pinakia.insert_one(doc)
+    doc["_id"] = str(result.inserted_id)
+    doc["uploaded_at"] = doc["uploaded_at"].isoformat()
+
+    await log_action(current_user["id"], "pinakio_upload", {
+        "court": court_name, "date": hearing_date, "hearings": len(hearings), "matches": match_count
+    })
+    return doc
+
+
+@app.post("/api/pinakia/intake")
+async def intake_pinakio(
+    file: UploadFile = File(...),
+    source_label: str = "gas",
+    x_api_key: str = Header(default="", alias="X-API-Key"),
+):
+    """Server-to-server pinakio intake (Google Apps Script, etc.). Auth via X-API-Key header."""
+    if not INTAKE_API_KEY or x_api_key != INTAKE_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    file_bytes = await file.read()
+    media_type = file.content_type or "application/pdf"
+    filename = file.filename or "pinakio"
+
+    try:
+        extracted = extract_pinakio(ANTHROPIC_API_KEY, file_bytes, media_type, MODEL_CHAT)
+    except Exception as e:
+        logger.error(f"Pinakio intake extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Αποτυχία εξαγωγής: {str(e)}")
+
+    hearings_raw = extracted.get("hearings") or []
+    hearing_date = extracted.get("hearing_date") or datetime.now(timezone.utc).date().isoformat()
+    court_name = extracted.get("court_name") or "Άγνωστο Δικαστήριο"
+
+    hearings = await match_pinakio_hearings(db, hearings_raw)
+    match_count = sum(1 for h in hearings if h.get("matched_case_id"))
+
+    doc = {
+        "court_name": court_name,
+        "hearing_date": hearing_date,
+        "file_name": filename,
+        "media_type": media_type,
+        "uploaded_at": datetime.now(timezone.utc),
+        "uploaded_by": source_label,
+        "source": source_label,
+        "hearings": hearings,
+        "hearing_count": len(hearings),
+        "match_count": match_count,
+    }
+    result = await db.pinakia.insert_one(doc)
+    doc["_id"] = str(result.inserted_id)
+    doc["uploaded_at"] = doc["uploaded_at"].isoformat()
+
+    logger.info(f"Pinakio intake ({source_label}): {court_name} {hearing_date} — {len(hearings)} hearings, {match_count} matches")
+
+    # Notify Telegram
+    from email_intake_service import _notify_telegram
+    await _notify_telegram(db, doc)
+
+    return {"ok": True, "id": doc["_id"], "court_name": court_name,
+            "hearing_date": hearing_date, "hearing_count": len(hearings), "match_count": match_count}
+
+
+@app.get("/api/pinakia")
+async def list_pinakia(
+    limit: int = 50,
+    current_user: dict = Depends(get_current_user),
+):
+    """List all court schedules, newest first."""
+    docs = await db.pinakia.find(
+        {}, {"hearings": 0}  # exclude full hearings list for list view
+    ).sort("hearing_date", -1).limit(limit).to_list(limit)
+    return [serialize(d) for d in docs]
+
+
+@app.get("/api/pinakia/hearings")
+async def get_hearings_by_date(
+    date: str = Query(..., description="YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get all hearings for a specific date across all pinakia."""
+    docs = await db.pinakia.find({"hearing_date": date}).to_list(20)
+    all_hearings = []
+    for doc in docs:
+        court = doc.get("court_name", "—")
+        for h in doc.get("hearings", []):
+            all_hearings.append({**h, "court_name": court, "pinakio_id": str(doc["_id"])})
+    return {"date": date, "hearings": all_hearings, "count": len(all_hearings)}
+
+
+@app.get("/api/pinakia/search")
+async def search_pinakia(
+    q: str = Query(..., min_length=2),
+    current_user: dict = Depends(get_current_user),
+):
+    """Search hearings by party name or case number."""
+    docs = await db.pinakia.find({
+        "$or": [
+            {"hearings.parties": {"$regex": q, "$options": "i"}},
+            {"hearings.case_number": {"$regex": q, "$options": "i"}},
+            {"court_name": {"$regex": q, "$options": "i"}},
+        ]
+    }).sort("hearing_date", -1).limit(20).to_list(20)
+
+    results = []
+    for doc in docs:
+        court = doc.get("court_name", "—")
+        date = doc.get("hearing_date", "—")
+        for h in doc.get("hearings", []):
+            parties_str = " ".join(h.get("parties", []))
+            case_num = h.get("case_number", "")
+            if (re.search(q, parties_str, re.IGNORECASE) or
+                    re.search(q, case_num, re.IGNORECASE)):
+                results.append({
+                    **h,
+                    "court_name": court,
+                    "hearing_date": date,
+                    "pinakio_id": str(doc["_id"]),
+                })
+    return {"query": q, "results": results, "count": len(results)}
+
+
+@app.get("/api/pinakia/{pinakio_id}")
+async def get_pinakio(
+    pinakio_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Get a single pinakio with all hearings."""
+    try:
+        oid = ObjectId(pinakio_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Μη έγκυρο ID")
+    doc = await db.pinakia.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Πινάκειο δεν βρέθηκε")
+    return serialize(doc)
+
+
+@app.delete("/api/pinakia/{pinakio_id}")
+async def delete_pinakio(
+    pinakio_id: str,
+    current_user: dict = Depends(require_role("admin", "lawyer")),
+):
+    try:
+        oid = ObjectId(pinakio_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Μη έγκυρο ID")
+    result = await db.pinakia.delete_one({"_id": oid})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Πινάκειο δεν βρέθηκε")
+    return {"ok": True}
+
+
+# ── Criminal Cases Module ──────────────────────────────────────────────────────
+
+from criminal_case_service import (
+    build_case_context, generate_output as cc_generate_output,
+    summarize_document as cc_summarize_document,
+    compute_health as cc_compute_health, days_until as cc_days_until,
+    render_pdf as cc_render_pdf, render_docx as cc_render_docx,
+    PROMPTS as CC_PROMPTS,
+)
+
+CC_OUTPUT_TITLES = {
+    "case_summary": "Περίληψη Υπόθεσης",
+    "chronology": "Χρονολόγιο Γεγονότων",
+    "missing_documents": "Checklist Ελλειπόντων Εγγράφων",
+    "client_questions": "Ερωτήσεις προς Πελάτη",
+    "witness_questions": "Ερωτήσεις προς Μάρτυρες",
+    "risk_analysis": "Ανάλυση Κινδύνου",
+    "court_brief": "Court Preparation Brief",
+    "client_email": "Draft Email προς Πελάτη",
+    "internal_memo": "Εσωτερικό Memo",
+    "defence_strategy": "Στρατηγική Υπεράσπισης (Draft)",
+    "prosecution_support": "Υποστήριξη Κατηγορίας (Draft)",
+    "legal_issues": "Νομικά Ζητήματα (Draft)",
+}
+
+CC_UPLOAD_DIR = Path(os.getenv("DOCUMENT_STORAGE_PATH", "/data/documents")) / "criminal"
+CC_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+async def _cc_get_case_or_404(case_id: str) -> dict:
+    case = await db.cc_cases.find_one({"id": case_id}, {"_id": 0})
+    if not case:
+        raise HTTPException(status_code=404, detail="Ποινική υπόθεση δεν βρέθηκε")
+    return case
+
+
+def _cc_extract_text(file_path: Path) -> str:
+    try:
+        ext = file_path.suffix.lower()
+        if ext == ".pdf":
+            try:
+                from PyPDF2 import PdfReader
+                reader = PdfReader(str(file_path))
+                return "\n".join((p.extract_text() or "") for p in reader.pages[:50])
+            except Exception:
+                return ""
+        if ext == ".docx":
+            try:
+                from docx import Document as _DocxDoc
+                d = _DocxDoc(str(file_path))
+                return "\n".join(p.text for p in d.paragraphs)
+            except Exception:
+                return ""
+        if ext in (".txt", ".md"):
+            try:
+                return file_path.read_text(encoding="utf-8", errors="ignore")[:50000]
+            except Exception:
+                return ""
+        return ""
+    except Exception as e:
+        logger.warning(f"cc_extract_text failed: {e}")
+        return ""
+
+
+async def _cc_overdue_task_count(case_id: str) -> int:
+    today = datetime.utcnow().date().isoformat()
+    return await db.cc_tasks.count_documents({
+        "case_id": case_id,
+        "status": {"$in": ["open", "in_progress"]},
+        "due_date": {"$lt": today, "$ne": None},
+    })
+
+
+async def _cc_unapproved_critical_outputs(case_id: str) -> int:
+    return await db.cc_outputs.count_documents({
+        "case_id": case_id,
+        "output_type": {"$in": ["court_brief", "client_email"]},
+        "status": {"$ne": "approved"},
+    })
+
+
+# ── Cases ────────────────────────────────────────────────────────────────────
+
+class CCCaseCreate(BaseModel):
+    case_title: str
+    client_name: str
+    client_email: Optional[str] = None
+    client_phone: Optional[str] = None
+    client_role: str = "accused"
+    opposing_party: Optional[str] = None
+    matter_type: str
+    court: Optional[str] = None
+    hearing_date: Optional[str] = None
+    urgency_level: str = "medium"
+    status: str = "intake"
+    short_description: str
+
+
+class CCCaseUpdate(BaseModel):
+    case_title: Optional[str] = None
+    client_name: Optional[str] = None
+    client_email: Optional[str] = None
+    client_phone: Optional[str] = None
+    client_role: Optional[str] = None
+    opposing_party: Optional[str] = None
+    matter_type: Optional[str] = None
+    court: Optional[str] = None
+    hearing_date: Optional[str] = None
+    urgency_level: Optional[str] = None
+    status: Optional[str] = None
+    short_description: Optional[str] = None
+
+
+@app.get("/api/criminal/cases")
+async def cc_list_cases(user=Depends(get_current_user)):
+    docs = await db.cc_cases.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return docs
+
+
+@app.post("/api/criminal/cases", status_code=201)
+async def cc_create_case(payload: CCCaseCreate, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY))):
+    if not payload.case_title.strip() or not payload.client_name.strip() \
+            or not payload.matter_type.strip() or not payload.short_description.strip():
+        raise HTTPException(400, "Λείπουν υποχρεωτικά πεδία")
+    now = datetime.utcnow().isoformat()
+    case_id = str(uuid.uuid4())
+    doc = {
+        "id": case_id,
+        **payload.model_dump(),
+        "case_title": sanitize_string(payload.case_title),
+        "client_name": sanitize_string(payload.client_name),
+        "matter_type": sanitize_string(payload.matter_type),
+        "short_description": sanitize_string(payload.short_description),
+        "created_by": user["id"],
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.cc_cases.insert_one(doc)
+    doc.pop("_id", None)
+    await audit("CC_CASE_CREATED", user["id"], "cc_case", case_id, {"title": doc["case_title"]})
+    return doc
+
+
+@app.get("/api/criminal/cases/{case_id}")
+async def cc_get_case(case_id: str, user=Depends(get_current_user)):
+    return await _cc_get_case_or_404(case_id)
+
+
+@app.patch("/api/criminal/cases/{case_id}")
+async def cc_update_case(case_id: str, payload: CCCaseUpdate, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY))):
+    await _cc_get_case_or_404(case_id)
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if "status" in updates and updates["status"] in ("court_preparation", "closed"):
+        if user["role"] not in (UserRole.ADMIN.value, UserRole.LAWYER.value):
+            raise HTTPException(403, "Μόνο δικηγόρος/admin μπορεί να αλλάξει αυτή την κατάσταση")
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    await db.cc_cases.update_one({"id": case_id}, {"$set": updates})
+    await audit("CC_CASE_UPDATED", user["id"], "cc_case", case_id, list(updates.keys()))
+    return await db.cc_cases.find_one({"id": case_id}, {"_id": 0})
+
+
+@app.delete("/api/criminal/cases/{case_id}")
+async def cc_delete_case(case_id: str, user=Depends(require_role(UserRole.ADMIN))):
+    await _cc_get_case_or_404(case_id)
+    await db.cc_cases.delete_one({"id": case_id})
+    for col in ("cc_parties", "cc_events", "cc_documents", "cc_evidence", "cc_issues", "cc_tasks", "cc_outputs"):
+        await db[col].delete_many({"case_id": case_id})
+    await audit("CC_CASE_DELETED", user["id"], "cc_case", case_id)
+    return {"ok": True}
+
+
+# ── Parties ──────────────────────────────────────────────────────────────────
+
+class CCPartyCreate(BaseModel):
+    name: str
+    role: str = "other"
+    contact_details: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@app.get("/api/criminal/cases/{case_id}/parties")
+async def cc_list_parties(case_id: str, user=Depends(get_current_user)):
+    await _cc_get_case_or_404(case_id)
+    return await db.cc_parties.find({"case_id": case_id}, {"_id": 0}).to_list(500)
+
+
+@app.post("/api/criminal/cases/{case_id}/parties", status_code=201)
+async def cc_create_party(case_id: str, payload: CCPartyCreate, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY))):
+    await _cc_get_case_or_404(case_id)
+    now = datetime.utcnow().isoformat()
+    doc = {"id": str(uuid.uuid4()), "case_id": case_id, **payload.model_dump(), "created_at": now}
+    await db.cc_parties.insert_one(doc)
+    doc.pop("_id", None)
+    await audit("CC_PARTY_ADDED", user["id"], "cc_party", doc["id"], {"name": payload.name})
+    return doc
+
+
+@app.delete("/api/criminal/cases/{case_id}/parties/{party_id}")
+async def cc_delete_party(case_id: str, party_id: str, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY))):
+    await db.cc_parties.delete_one({"id": party_id, "case_id": case_id})
+    await audit("CC_PARTY_DELETED", user["id"], "cc_party", party_id)
+    return {"ok": True}
+
+
+# ── Events (Timeline) ────────────────────────────────────────────────────────
+
+class CCEventCreate(BaseModel):
+    event_date: str
+    event_time: Optional[str] = None
+    event_description: str
+    source: Optional[str] = None
+    confidence_level: str = "alleged"
+    notes: Optional[str] = None
+
+
+@app.get("/api/criminal/cases/{case_id}/events")
+async def cc_list_events(case_id: str, user=Depends(get_current_user)):
+    await _cc_get_case_or_404(case_id)
+    return await db.cc_events.find({"case_id": case_id}, {"_id": 0}).sort("event_date", 1).to_list(500)
+
+
+@app.post("/api/criminal/cases/{case_id}/events", status_code=201)
+async def cc_create_event(case_id: str, payload: CCEventCreate, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY))):
+    await _cc_get_case_or_404(case_id)
+    now = datetime.utcnow().isoformat()
+    doc = {"id": str(uuid.uuid4()), "case_id": case_id, **payload.model_dump(), "created_at": now}
+    await db.cc_events.insert_one(doc)
+    doc.pop("_id", None)
+    await audit("CC_EVENT_ADDED", user["id"], "cc_event", doc["id"])
+    return doc
+
+
+@app.delete("/api/criminal/cases/{case_id}/events/{event_id}")
+async def cc_delete_event(case_id: str, event_id: str, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY))):
+    await db.cc_events.delete_one({"id": event_id, "case_id": case_id})
+    await audit("CC_EVENT_DELETED", user["id"], "cc_event", event_id)
+    return {"ok": True}
+
+
+# ── Documents ────────────────────────────────────────────────────────────────
+
+@app.get("/api/criminal/cases/{case_id}/documents")
+async def cc_list_documents(case_id: str, user=Depends(get_current_user)):
+    await _cc_get_case_or_404(case_id)
+    return await db.cc_documents.find({"case_id": case_id}, {"_id": 0}).sort("upload_date", -1).to_list(500)
+
+
+@app.post("/api/criminal/cases/{case_id}/documents", status_code=201)
+async def cc_upload_document(
+    case_id: str,
+    file: UploadFile = File(...),
+    category: str = Form("other"),
+    importance_level: str = Form("medium"),
+    user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY)),
+):
+    await _cc_get_case_or_404(case_id)
+    if not file.filename:
+        raise HTTPException(400, "Κενό αρχείο")
+    case_dir = CC_UPLOAD_DIR / case_id
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    valid_categories = {"police_report", "witness_statement", "medical_report", "photo", "video", "court_document", "email", "other"}
+    valid_importance = {"low", "medium", "high", "critical"}
+    doc_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+
+    target = case_dir / f"{doc_id}__{file.filename}"
+    raw = await file.read()
+    target.write_bytes(raw)
+
+    text = _cc_extract_text(target)
+    summary = None
+    if text:
+        try:
+            summary = await cc_summarize_document(file.filename, text[:50000], "el")
+        except Exception as e:
+            logger.warning(f"CC AI summary failed: {e}")
+
+    doc = {
+        "id": doc_id,
+        "case_id": case_id,
+        "file_name": file.filename,
+        "file_type": file.content_type or "application/octet-stream",
+        "category": category if category in valid_categories else "other",
+        "importance_level": importance_level if importance_level in valid_importance else "medium",
+        "upload_date": now,
+        "summary": summary,
+        "extracted_text": (text or "")[:50000],
+        "stored_path": str(target),
+        "size_bytes": len(raw),
+    }
+    await db.cc_documents.insert_one(doc)
+    doc.pop("_id", None)
+    await audit("CC_DOCUMENT_UPLOADED", user["id"], "cc_document", doc_id, {"file_name": file.filename})
+    return doc
+
+
+@app.delete("/api/criminal/cases/{case_id}/documents/{doc_id}")
+async def cc_delete_document(case_id: str, doc_id: str, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER))):
+    doc = await db.cc_documents.find_one({"id": doc_id, "case_id": case_id}, {"_id": 0})
+    if doc and doc.get("stored_path"):
+        try:
+            Path(doc["stored_path"]).unlink(missing_ok=True)
+        except Exception:
+            pass
+    await db.cc_documents.delete_one({"id": doc_id, "case_id": case_id})
+    await audit("CC_DOCUMENT_DELETED", user["id"], "cc_document", doc_id)
+    return {"ok": True}
+
+
+# ── Evidence ─────────────────────────────────────────────────────────────────
+
+class CCEvidenceCreate(BaseModel):
+    title: str
+    description: Optional[str] = None
+    source: Optional[str] = None
+    supports: str = "neutral"
+    weakens: Optional[str] = None
+    reliability: str = "unverified"
+
+
+@app.get("/api/criminal/cases/{case_id}/evidence")
+async def cc_list_evidence(case_id: str, user=Depends(get_current_user)):
+    await _cc_get_case_or_404(case_id)
+    return await db.cc_evidence.find({"case_id": case_id}, {"_id": 0}).to_list(500)
+
+
+@app.post("/api/criminal/cases/{case_id}/evidence", status_code=201)
+async def cc_create_evidence(case_id: str, payload: CCEvidenceCreate, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY))):
+    await _cc_get_case_or_404(case_id)
+    now = datetime.utcnow().isoformat()
+    doc = {"id": str(uuid.uuid4()), "case_id": case_id, **payload.model_dump(), "created_at": now}
+    await db.cc_evidence.insert_one(doc)
+    doc.pop("_id", None)
+    await audit("CC_EVIDENCE_ADDED", user["id"], "cc_evidence", doc["id"], {"title": payload.title})
+    return doc
+
+
+@app.delete("/api/criminal/cases/{case_id}/evidence/{evidence_id}")
+async def cc_delete_evidence(case_id: str, evidence_id: str, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY))):
+    await db.cc_evidence.delete_one({"id": evidence_id, "case_id": case_id})
+    await audit("CC_EVIDENCE_DELETED", user["id"], "cc_evidence", evidence_id)
+    return {"ok": True}
+
+
+# ── Legal Issues ──────────────────────────────────────────────────────────────
+
+class CCIssueCreate(BaseModel):
+    issue_title: str
+    facts_supporting: Optional[str] = None
+    missing_facts: Optional[str] = None
+    risk_level: str = "medium"
+    lawyer_notes: Optional[str] = None
+
+
+@app.get("/api/criminal/cases/{case_id}/issues")
+async def cc_list_issues(case_id: str, user=Depends(get_current_user)):
+    await _cc_get_case_or_404(case_id)
+    return await db.cc_issues.find({"case_id": case_id}, {"_id": 0}).to_list(500)
+
+
+@app.post("/api/criminal/cases/{case_id}/issues", status_code=201)
+async def cc_create_issue(case_id: str, payload: CCIssueCreate, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY))):
+    await _cc_get_case_or_404(case_id)
+    now = datetime.utcnow().isoformat()
+    doc = {"id": str(uuid.uuid4()), "case_id": case_id, **payload.model_dump(), "created_at": now}
+    await db.cc_issues.insert_one(doc)
+    doc.pop("_id", None)
+    await audit("CC_ISSUE_ADDED", user["id"], "cc_issue", doc["id"], {"title": payload.issue_title})
+    return doc
+
+
+@app.delete("/api/criminal/cases/{case_id}/issues/{issue_id}")
+async def cc_delete_issue(case_id: str, issue_id: str, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY))):
+    await db.cc_issues.delete_one({"id": issue_id, "case_id": case_id})
+    await audit("CC_ISSUE_DELETED", user["id"], "cc_issue", issue_id)
+    return {"ok": True}
+
+
+# ── Tasks ────────────────────────────────────────────────────────────────────
+
+class CCTaskCreate(BaseModel):
+    title: str
+    description: Optional[str] = None
+    assigned_to: Optional[str] = None
+    due_date: Optional[str] = None
+    priority: str = "medium"
+    status: str = "open"
+
+
+class CCTaskUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    assigned_to: Optional[str] = None
+    due_date: Optional[str] = None
+    priority: Optional[str] = None
+    status: Optional[str] = None
+
+
+@app.get("/api/criminal/cases/{case_id}/tasks")
+async def cc_list_tasks(case_id: str, user=Depends(get_current_user)):
+    await _cc_get_case_or_404(case_id)
+    return await db.cc_tasks.find({"case_id": case_id}, {"_id": 0}).to_list(500)
+
+
+@app.post("/api/criminal/cases/{case_id}/tasks", status_code=201)
+async def cc_create_task(case_id: str, payload: CCTaskCreate, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY))):
+    await _cc_get_case_or_404(case_id)
+    now = datetime.utcnow().isoformat()
+    doc = {"id": str(uuid.uuid4()), "case_id": case_id, **payload.model_dump(), "created_at": now}
+    await db.cc_tasks.insert_one(doc)
+    doc.pop("_id", None)
+    await audit("CC_TASK_ADDED", user["id"], "cc_task", doc["id"], {"title": payload.title})
+    return doc
+
+
+@app.patch("/api/criminal/cases/{case_id}/tasks/{task_id}")
+async def cc_update_task(case_id: str, task_id: str, payload: CCTaskUpdate, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY))):
+    doc = await db.cc_tasks.find_one({"id": task_id, "case_id": case_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Task δεν βρέθηκε")
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if updates:
+        await db.cc_tasks.update_one({"id": task_id}, {"$set": updates})
+        doc.update(updates)
+    await audit("CC_TASK_UPDATED", user["id"], "cc_task", task_id)
+    return doc
+
+
+@app.delete("/api/criminal/cases/{case_id}/tasks/{task_id}")
+async def cc_delete_task(case_id: str, task_id: str, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY))):
+    await db.cc_tasks.delete_one({"id": task_id, "case_id": case_id})
+    await audit("CC_TASK_DELETED", user["id"], "cc_task", task_id)
+    return {"ok": True}
+
+
+# ── AI Outputs ────────────────────────────────────────────────────────────────
+
+class CCGenerateRequest(BaseModel):
+    output_type: str
+    language: str = "el"
+    extra_context: Optional[str] = None
+
+
+class CCOutputUpdate(BaseModel):
+    content: Optional[str] = None
+    status: Optional[str] = None
+
+
+@app.get("/api/criminal/cases/{case_id}/outputs")
+async def cc_list_outputs(case_id: str, user=Depends(get_current_user)):
+    await _cc_get_case_or_404(case_id)
+    return await db.cc_outputs.find({"case_id": case_id}, {"_id": 0}).sort("created_at", -1).to_list(500)
+
+
+@app.post("/api/criminal/cases/{case_id}/outputs/generate", status_code=201)
+async def cc_generate_ai_output(case_id: str, payload: CCGenerateRequest, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER, UserRole.SECRETARY))):
+    case = await _cc_get_case_or_404(case_id)
+    parties = await db.cc_parties.find({"case_id": case_id}, {"_id": 0}).to_list(500)
+    events = await db.cc_events.find({"case_id": case_id}, {"_id": 0}).sort("event_date", 1).to_list(500)
+    documents = await db.cc_documents.find({"case_id": case_id}, {"_id": 0}).to_list(500)
+    evidence = await db.cc_evidence.find({"case_id": case_id}, {"_id": 0}).to_list(500)
+    issues = await db.cc_issues.find({"case_id": case_id}, {"_id": 0}).to_list(500)
+
+    context = build_case_context(case, parties, events, documents, evidence, issues)
+    try:
+        content = await cc_generate_output(payload.output_type, payload.language, context, payload.extra_context)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.exception("CC AI generation failed")
+        raise HTTPException(502, f"AI generation failed: {e}")
+
+    now = datetime.utcnow().isoformat()
+    out = {
+        "id": str(uuid.uuid4()),
+        "case_id": case_id,
+        "output_type": payload.output_type,
+        "title": CC_OUTPUT_TITLES.get(payload.output_type, payload.output_type),
+        "content": content,
+        "language": payload.language,
+        "status": "draft",
+        "created_by": user["id"],
+        "approved_by": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.cc_outputs.insert_one(out)
+    out.pop("_id", None)
+    await audit("CC_AI_GENERATED", user["id"], "cc_output", out["id"], {"output_type": payload.output_type})
+    return out
+
+
+@app.patch("/api/criminal/cases/{case_id}/outputs/{output_id}")
+async def cc_update_output(case_id: str, output_id: str, payload: CCOutputUpdate, user=Depends(get_current_user)):
+    doc = await db.cc_outputs.find_one({"id": output_id, "case_id": case_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Output δεν βρέθηκε")
+    updates: dict = {}
+    if payload.content is not None:
+        if user["role"] not in (UserRole.ADMIN.value, UserRole.LAWYER.value, UserRole.SECRETARY.value):
+            raise HTTPException(403, "Δεν επιτρέπεται επεξεργασία")
+        updates["content"] = payload.content
+        updates["status"] = "revised"
+    if payload.status is not None:
+        if payload.status in ("approved", "rejected"):
+            if user["role"] not in (UserRole.ADMIN.value, UserRole.LAWYER.value):
+                raise HTTPException(403, "Μόνο δικηγόρος/admin μπορεί να εγκρίνει/απορρίψει")
+            updates["status"] = payload.status
+            updates["approved_by"] = user["id"] if payload.status == "approved" else None
+        else:
+            updates["status"] = payload.status
+    if updates:
+        updates["updated_at"] = datetime.utcnow().isoformat()
+        await db.cc_outputs.update_one({"id": output_id}, {"$set": updates})
+        doc.update(updates)
+        await audit(f"CC_OUTPUT_{updates.get('status', 'updated').upper()}", user["id"], "cc_output", output_id)
+    return doc
+
+
+@app.delete("/api/criminal/cases/{case_id}/outputs/{output_id}")
+async def cc_delete_output(case_id: str, output_id: str, user=Depends(require_role(UserRole.ADMIN, UserRole.LAWYER))):
+    await db.cc_outputs.delete_one({"id": output_id, "case_id": case_id})
+    await audit("CC_OUTPUT_DELETED", user["id"], "cc_output", output_id)
+    return {"ok": True}
+
+
+# ── Export ────────────────────────────────────────────────────────────────────
+
+@app.get("/api/criminal/cases/{case_id}/outputs/{output_id}/export")
+async def cc_export_output(case_id: str, output_id: str, format: str = "pdf", user=Depends(get_current_user)):
+    case = await _cc_get_case_or_404(case_id)
+    doc = await db.cc_outputs.find_one({"id": output_id, "case_id": case_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Output δεν βρέθηκε")
+
+    if doc["output_type"] in ("client_email", "court_brief") and doc["status"] != "approved":
+        if user["role"] not in (UserRole.ADMIN.value, UserRole.LAWYER.value):
+            raise HTTPException(403, "Output δεν έχει εγκριθεί")
+
+    fmt = (format or "pdf").lower()
+    if fmt == "pdf":
+        data = cc_render_pdf(case["case_title"], doc["title"], doc["content"], doc["status"])
+        media = "application/pdf"
+        ext = "pdf"
+    elif fmt == "docx":
+        data = cc_render_docx(case["case_title"], doc["title"], doc["content"], doc["status"])
+        media = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ext = "docx"
+    else:
+        raise HTTPException(400, "Μη υποστηριζόμενη μορφή")
+
+    await audit("CC_OUTPUT_EXPORTED", user["id"], "cc_output", output_id, {"format": ext})
+    from urllib.parse import quote
+    raw_name = "".join(c for c in doc["title"] if c.isalnum() or c in " -_").strip().replace(" ", "_") or "output"
+    ascii_fallback = raw_name.encode("ascii", "ignore").decode("ascii") or doc["output_type"]
+    utf8_quoted = quote(raw_name, safe="")
+    headers = {
+        "Content-Disposition": (
+            f'attachment; filename="{ascii_fallback}.{ext}"; '
+            f"filename*=UTF-8''{utf8_quoted}.{ext}"
+        )
+    }
+    return StreamingResponse(iter([data]), media_type=media, headers=headers)
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
+
+@app.get("/api/criminal/cases/{case_id}/health")
+async def cc_case_health(case_id: str, user=Depends(get_current_user)):
+    case = await _cc_get_case_or_404(case_id)
+    doc_count = await db.cc_documents.count_documents({"case_id": case_id})
+    overdue_tasks = await _cc_overdue_task_count(case_id)
+    unapproved_critical = await _cc_unapproved_critical_outputs(case_id)
+    missing_docs = doc_count == 0
+    health = cc_compute_health(case, doc_count, overdue_tasks, unapproved_critical, missing_docs)
+    health["hearing_days_left"] = cc_days_until(case.get("hearing_date"))
+    return health
+
+
+# ── Audit log per criminal case ───────────────────────────────────────────────
+
+@app.get("/api/criminal/cases/{case_id}/audit")
+async def cc_case_audit(case_id: str, user=Depends(get_current_user)):
+    await _cc_get_case_or_404(case_id)
+    docs = await db.audit_logs.find(
+        {"resource": "cc_case", "resource_id": case_id},
+        {"_id": 0},
+    ).sort("timestamp", -1).to_list(200)
+    return [serialize(d) for d in docs]

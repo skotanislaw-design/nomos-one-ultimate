@@ -7,6 +7,7 @@ import {
 import { invoicingApi, casesApi, emailApi, exportApi } from '@/lib/api';
 import { SegmentTabs } from '@/components/ui/SegmentTabs';
 import { toast } from 'sonner';
+import { parseTs } from '@/lib/prefs';
 
 type InvoiceTab = 'invoices' | 'monthly';
 
@@ -18,6 +19,15 @@ const FIRM_EMAIL   = 'christos@skotanislaw.com';
 const FIRM_AFM     = '123456789';
 
 const GRAMMATIO_RATES = { efka: 0.2695, ean: 0.0167, dsa: 0.0200 };
+
+const EXPENSE_LABELS: Record<string, string> = {
+  grammatio: 'Προείσπραξη (Γραμμάτιο Συλλόγου)',
+  parabolon: 'Παράβολο', ensima: 'Ένσημα', court_fees: 'Δικαστικά Τέλη',
+  travel: 'Μετάβαση / Μετακίνηση', meal: 'Σίτιση', apostoli: 'Αποστολή / Courier',
+  copies: 'Φωτοτυπίες / Αντίγραφα', filing: 'Κατάθεση Εγγράφων',
+  postage: 'Ταχυδρομικά', notary: 'Συμβολαιογράφος', translation: 'Μεταφράσεις',
+  expert_witness: 'Πραγματογνωμοσύνη', expert_fee: 'Αμοιβή Εμπειρογνώμονα', other: 'Λοιπά',
+};
 
 /* ─── helpers ─────────────────────────────────────────────────── */
 const fmt = (n: number) => `€${Number(n || 0).toLocaleString('el-GR', { minimumFractionDigits: 2 })}`;
@@ -176,9 +186,9 @@ function InvoiceDocument(p: InvoiceDocProps) {
               <div className="flex justify-between text-sm">
                 <span className="text-gray-600">
                   Γραμμάτιο Προείσπραξης Δ.Σ.
-                  <span className="ml-2 text-xs text-emerald-700 font-medium">(ήδη καταβληθέν)</span>
+                  <span className="ml-2 text-xs text-orange-600 font-medium">(επιπλέον αμοιβής)</span>
                 </span>
-                <span className="font-mono text-emerald-700">− {fmt(p.grammatioGross)}</span>
+                <span className="font-mono text-orange-600">+ {fmt(p.grammatioGross)}</span>
               </div>
               {p.grammatioDetails && (
                 <div className="pl-4 text-xs text-gray-400 space-y-0.5">
@@ -281,9 +291,27 @@ export default function InvoicingPage() {
           setClientAfm(d.client.afm || '');
           setClientAddress(d.client.address || '');
         }
+        // Auto-import billable expenses (γραμμάτιο, παράβολα, ένσημα κλπ.) ως expense line items
+        const billableExpenses: any[] = (d.expenses || []).filter((e: any) => e.billable_to_client === true);
+        if (billableExpenses.length > 0) {
+          const grouped: Record<string, number> = {};
+          billableExpenses.forEach((e: any) => {
+            const cat = e.category || 'other';
+            grouped[cat] = (grouped[cat] || 0) + Number(e.amount || 0);
+          });
+          const expLines: LineItem[] = Object.entries(grouped)
+            .filter(([, total]) => total > 0)
+            .map(([cat, total]) => ({
+              description: EXPENSE_LABELS[cat] || cat,
+              amount: String(Number(total).toFixed(2)),
+              is_expense: true,
+            }));
+          setItems(prev => [...prev.filter(it => !it.is_expense), ...expLines]);
+        }
+        // Auto-populate grammatio toggle για ανάλυση κρατήσεων (εσωτερικό)
         if (d.grammatia?.length > 0) {
-          const g = d.grammatia[0];
-          setGrammatio(prev => ({ ...prev, include: true, gross: String(g.amount || '') }));
+          const totalGram = d.grammatia.reduce((s: number, g: any) => s + Number(g.amount || 0), 0);
+          setGrammatio(prev => ({ ...prev, include: true, gross: String(totalGram.toFixed(2)) }));
         }
       })
       .catch(() => setContext(null))
@@ -299,7 +327,9 @@ export default function InvoicingPage() {
   const withholding   = isProfessional ? totalFees * 0.20 : 0;
   const subtotal      = totalFees + vat + totalExpenses - withholding;
   const gCalc         = calcGrammatio(grammatio);
-  const totalPayable  = grammatio.include ? subtotal - gCalc.gross : subtotal;
+  // Γραμμάτιο = πρόσθετο κόστος ΓΙΑ τον εντολέα (επιπλέον της αμοιβής), ΟΧΙ αφαίρεση
+  const totalPayable  = grammatio.include ? subtotal + gCalc.gross : subtotal;
+  // Καθαρό εισπρακτέο = αμοιβή + έξοδα + γραμμάτιο gross − κρατήσεις Bar Association − παρακράτηση
   const lawyerReceives = totalFees - withholding + totalExpenses + (grammatio.include ? gCalc.netToLawyer : 0);
 
   /* ── selected case info for proforma ──────────────────────── */
@@ -313,9 +343,14 @@ export default function InvoicingPage() {
 
   const importExpenses = () => {
     if (!context?.expenses_by_category) return;
-    const expLines: LineItem[] = context.expenses_by_category
-      .filter((cat: any) => cat.total > 0)
-      .map((cat: any) => ({ description: cat.category, amount: String(cat.total.toFixed(2)), is_expense: true }));
+    // expenses_by_category is a dict {category: total}
+    const expLines: LineItem[] = Object.entries(context.expenses_by_category as Record<string, number>)
+      .filter(([, total]) => total > 0)
+      .map(([cat, total]) => ({
+        description: EXPENSE_LABELS[cat] || cat,
+        amount: String(Number(total).toFixed(2)),
+        is_expense: true,
+      }));
     setItems(prev => [...prev.filter(it => !it.is_expense), ...expLines]);
     toast.success('Έξοδα εισήχθησαν');
   };
@@ -445,7 +480,7 @@ export default function InvoicingPage() {
   /* ── monthly grouping ──────────────────────────────────────── */
   const monthlyMap: Record<string, any> = {};
   invoices.forEach(inv => {
-    const d = inv.created_at ? new Date(inv.created_at) : new Date();
+    const d = inv.created_at ? (parseTs(inv.created_at) ?? new Date()) : new Date();
     const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
     const label = d.toLocaleDateString('el-GR', { month: 'long', year: 'numeric' });
     if (!monthlyMap[key]) monthlyMap[key] = { key, label, gross: 0, vat: 0, withholding: 0, net: 0, count: 0 };
@@ -506,7 +541,7 @@ export default function InvoicingPage() {
 
       {/* ── Invoices list ── */}
       {activeTab === 'invoices' && (
-        <div className="glass-card overflow-hidden">
+        <div className="glass-card overflow-hidden table-scroll">
           <table className="w-full table-premium">
             <thead>
               <tr className="bg-[#0d2035]/40">
@@ -533,7 +568,7 @@ export default function InvoicingPage() {
                       <p className="text-xs font-medium text-[#d4dce8]">{inv.case_title || '—'}</p>
                       {inv.client_name && <p className="text-[10px] text-[#5a7a9a]">{inv.client_name}</p>}
                     </td>
-                    <td className="hidden sm:table-cell text-xs">{inv.created_at ? new Date(inv.created_at).toLocaleDateString('el-GR') : '—'}</td>
+                    <td className="hidden sm:table-cell text-xs">{inv.created_at ? (parseTs(inv.created_at)?.toLocaleDateString('el-GR') ?? '—') : '—'}</td>
                     <td className="font-mono text-sm font-semibold text-[#C6A75E]">{fmt(Number(inv.total || amount + invVat))}</td>
                     <td className="hidden md:table-cell font-mono text-xs text-blue-400">{fmt(invVat)}</td>
                     <td className="hidden lg:table-cell font-mono text-xs text-purple-400">{wh > 0 ? fmt(wh) : <span className="text-[#3a5a7a]">—</span>}</td>
@@ -587,7 +622,7 @@ export default function InvoicingPage() {
               </div>
             ))}
           </div>
-          <div className="glass-card overflow-hidden">
+          <div className="glass-card overflow-hidden table-scroll">
             <div className="p-5 border-b border-[#1a3a5c]/40">
               <h3 className="section-title">Μηνιαία Ανάλυση Φόρων</h3>
               <p className="text-xs text-[#5a7a9a] mt-1">ΦΠΑ 24% και Παρακράτηση Φόρου 20%</p>
@@ -710,7 +745,7 @@ export default function InvoicingPage() {
                             <p className="text-[10px] uppercase tracking-wider text-[#5a7a9a] mb-2">Προηγούμενα Τιμολόγια</p>
                             {context.existing_invoices.map((inv: any) => (
                               <div key={inv._id} className="flex justify-between text-xs py-1 border-b border-[#1a3a5c]/20 last:border-0">
-                                <span className="text-[#8aa0b8]">#{inv.invoice_number || inv._id?.slice(-6)} — {inv.created_at ? new Date(inv.created_at).toLocaleDateString('el-GR') : ''}</span>
+                                <span className="text-[#8aa0b8]">#{inv.invoice_number || inv._id?.slice(-6)} — {inv.created_at ? (parseTs(inv.created_at)?.toLocaleDateString('el-GR') ?? '') : ''}</span>
                                 <span className={`font-mono ${inv.status === 'paid' ? 'text-emerald-400' : 'text-amber-400'}`}>{fmt(Number(inv.total || inv.amount || 0))}</span>
                               </div>
                             ))}
@@ -798,7 +833,7 @@ export default function InvoicingPage() {
               {/* ── Γ. Γραμμάτιο ── */}
               <div className="p-5 space-y-3">
                 <div className="flex items-center justify-between">
-                  <p className="text-[10px] uppercase tracking-widest text-[#C6A75E] font-semibold">Γ. Γραμμάτιο Προείσπραξης Δ.Σ.</p>
+                  <p className="text-[10px] uppercase tracking-widest text-[#C6A75E] font-semibold">Γ. Ανάλυση Κρατήσεων Γραμματίου (Εσωτερικό)</p>
                   <button type="button" onClick={() => setGrammatio(prev => ({ ...prev, include: !prev.include }))}
                     className={`w-11 h-6 rounded-full transition-colors relative ${grammatio.include ? 'bg-emerald-500' : 'bg-[#1a3a5c]'}`}>
                     <div className={`absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${grammatio.include ? 'translate-x-5' : 'translate-x-0.5'}`} />
@@ -809,8 +844,7 @@ export default function InvoicingPage() {
                     <div className="flex items-start gap-2">
                       <AlertCircle size={13} className="text-emerald-400 flex-shrink-0 mt-0.5" />
                       <p className="text-[10px] text-[#6a8aaa]">
-                        Λογίζεται ως <strong className="text-emerald-400">ήδη καταβληθέν</strong>.
-                        Αφαιρείται από το σύνολο. Οι κρατήσεις (ΕΦΚΑ/ΕΑΝ/ΔΣ) υπολογίζονται αυτόματα εάν δεν συμπληρωθούν.
+                        Εσωτερική ανάλυση κρατήσεων Συλλόγου. Το ονομαστικό ποσό χρεώνεται <strong className="text-orange-400">επιπλέον</strong> της αμοιβής στον εντολέα (εμφανίζεται ως Έξοδο στο τιμολόγιο). Οι κρατήσεις (ΕΦΚΑ/ΕΑΝ/ΔΣ) υπολογίζονται αυτόματα εάν δεν συμπληρωθούν.
                       </p>
                     </div>
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -874,7 +908,7 @@ export default function InvoicingPage() {
                       <span className="text-[#d4dce8]">Υποσύνολο</span><span className="font-mono text-white">{fmt(subtotal)}</span>
                     </div>
                     {grammatio.include && gCalc.gross > 0 && <>
-                      <div className="flex justify-between text-sm"><span className="text-[#8aa0b8]">Γραμμάτιο (ήδη καταβληθέν)</span><span className="font-mono text-emerald-400">− {fmt(gCalc.gross)}</span></div>
+                      <div className="flex justify-between text-sm"><span className="text-[#8aa0b8]">Γραμμάτιο (επιπλέον αμοιβής)</span><span className="font-mono text-orange-400">+ {fmt(gCalc.gross)}</span></div>
                     </>}
                     <div className="pt-2 border-t-2 border-[#C6A75E]/30 flex justify-between">
                       <span className="text-base font-bold text-[#C6A75E]">Υπόλοιπο Πληρωτέο</span>
@@ -1049,7 +1083,7 @@ export default function InvoicingPage() {
             <InvoiceDocument
               isProforma={false}
               invNumber={previewInvoice.invoice_number || previewInvoice._id?.slice(-6) || '—'}
-              invDate={previewInvoice.created_at ? new Date(previewInvoice.created_at).toLocaleDateString('el-GR') : new Date().toLocaleDateString('el-GR')}
+              invDate={previewInvoice.created_at ? (parseTs(previewInvoice.created_at)?.toLocaleDateString('el-GR') ?? new Date().toLocaleDateString('el-GR')) : new Date().toLocaleDateString('el-GR')}
               clientName={previewInvoice.client_name || ''}
               clientAfm={previewInvoice.client_afm}
               clientAddress={previewInvoice.client_address}
