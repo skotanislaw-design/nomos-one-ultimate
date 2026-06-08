@@ -148,6 +148,6 @@ _push_service: Optional[PushService] = None
 
 def get_push_service(db=None) -> PushService:
     global _push_service
-    if _push_service is None or (db and _push_service.db is None):
+    if _push_service is None or (db is not None and _push_service.db is None):
         _push_service = PushService(db)
     return _push_service
