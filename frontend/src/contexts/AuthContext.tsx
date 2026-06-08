@@ -55,8 +55,23 @@ async function subscribeToPush(token: string): Promise<void> {
     });
     const applicationServerKey = urlBase64ToUint8Array(data.public_key);
 
-    // Subscribe (or reuse existing)
+    // Resubscribe if no subscription or if it uses a different VAPID key
     let sub = await reg.pushManager.getSubscription();
+    if (sub) {
+      const existingKey = (sub.options as any)?.applicationServerKey as ArrayBuffer | undefined;
+      if (!existingKey) {
+        await sub.unsubscribe();
+        sub = null;
+      } else {
+        const existingBytes = new Uint8Array(existingKey);
+        const keyMatch = existingBytes.length === applicationServerKey.length &&
+          existingBytes.every((b, i) => b === applicationServerKey[i]);
+        if (!keyMatch) {
+          await sub.unsubscribe();
+          sub = null;
+        }
+      }
+    }
     if (!sub) {
       sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey });
     }

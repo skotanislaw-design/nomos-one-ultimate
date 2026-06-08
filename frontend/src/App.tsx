@@ -3,7 +3,7 @@ import { Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
 import { PortalAuthProvider, usePortalAuth } from '@/contexts/PortalAuthContext';
 import { WebSocketProvider } from '@/contexts/WebSocketContext';
-import { Toaster } from 'sonner';
+import { Toaster, toast } from 'sonner';
 import AppShell from '@/components/layout/AppShell';
 import LoginPage from '@/pages/LoginPage';
 import ClientPortalLoginPage from '@/pages/ClientPortalLoginPage';
@@ -38,12 +38,23 @@ function PortalProtectedRoute({ children }: { children: React.ReactNode }) {
 }
 
 export default function App() {
-  // Initialize Firebase on app load
   useEffect(() => {
-    initializeFirebase().catch(err => {
-      console.warn('[App] Firebase initialization error:', err);
-      // Non-critical, app continues without Firebase
-    });
+    initializeFirebase().catch(() => {});
+  }, []);
+
+  // In-app toast fallback for push notifications (fires when service worker receives push)
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+    const handler = (event: MessageEvent) => {
+      if (event.data?.type === 'PUSH_NOTIFICATION') {
+        toast(event.data.title || 'Nomos One', {
+          description: event.data.body,
+          duration: 8000,
+        });
+      }
+    };
+    navigator.serviceWorker.addEventListener('message', handler);
+    return () => navigator.serviceWorker.removeEventListener('message', handler);
   }, []);
 
   return (

@@ -46,15 +46,20 @@ self.addEventListener('push', (event) => {
   if (event.data) {
     try { Object.assign(data, event.data.json()); } catch (e) {}
   }
+  const notifyClients = self.clients.matchAll({ type: 'window', includeUncontrolled: true })
+    .then(list => list.forEach(c => c.postMessage({ type: 'PUSH_NOTIFICATION', title: data.title, body: data.body, path: data.path })));
   event.waitUntil(
-    self.registration.showNotification(data.title, {
-      body: data.body,
-      icon: data.icon,
-      badge: data.badge,
-      tag: 'nomos-notification',
-      data: { path: data.path },
-      requireInteraction: true,
-    })
+    Promise.all([
+      self.registration.showNotification(data.title, {
+        body: data.body,
+        icon: data.icon,
+        badge: data.badge,
+        tag: 'nomos-notification',
+        data: { path: data.path },
+        requireInteraction: true,
+      }),
+      notifyClients,
+    ])
   );
 });
 
