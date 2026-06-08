@@ -1936,13 +1936,21 @@ async def portal_send_message(req: PortalMessageRequest, user=Depends(get_portal
 
     result = await db.portal_messages.insert_one(message)
 
-    # Notify lawyer and admin
+    # Notify lawyer via push
     lawyer_id = case.get("assigned_lawyer_id")
     if lawyer_id:
-        # TODO: Send native notification to lawyer
-        pass
-
-    # TODO: Send email to lawyer and admin
+        try:
+            push_svc = get_push_service(db)
+            client_name = case.get("client_name", "Πελάτης")
+            msg_text = message.get("message", "")[:80]
+            await push_svc.send_to_user(
+                str(lawyer_id),
+                title="Νέο μήνυμα από πελάτη",
+                body=f"{client_name}: {msg_text}",
+                path="/admin-portal",
+            )
+        except Exception as _pe:
+            logger.warning(f"Push notification failed: {_pe}")
 
     await audit("PORTAL_MESSAGE", user.get("client_id", ""), "portal", str(result.inserted_id))
     return {"ok": True, "message_id": str(result.inserted_id)}
@@ -6801,3 +6809,58 @@ async def cc_case_audit(case_id: str, user=Depends(get_current_user)):
         {"_id": 0},
     ).sort("timestamp", -1).to_list(200)
     return [serialize(d) for d in docs]
+
+
+# ── VAPID Web Push Endpoints ──────────────────────────────────────────────────
+
+class PushSubscribeRequest(BaseModel):
+    endpoint: str
+    auth: str
+    p256dh: str
+    user_agent: Optional[str] = None
+
+@app.get("/api/v1/push/vapid-public-key")
+async def get_vapid_public_key():
+    """Return VAPID public key for browser push subscription."""
+    key = os.getenv("VAPID_PUBLIC_KEY", "")
+    if not key:
+        raise HTTPException(503, "Push notifications not configured")
+    return {"public_key": key}
+
+@app.post("/api/v1/push/subscribe")
+async def subscribe_push(req: PushSubscribeRequest, request: Request, user=Depends(get_current_user)):
+    """Store a Web Push subscription for the current user."""
+    if not req.endpoint or not req.auth or not req.p256dh:
+        raise HTTPException(400, "Missing subscription fields")
+
+    await db.push_subscriptions.update_one(
+        {"user_id": user["id"], "endpoint": req.endpoint},
+        {"$set": {
+            "user_id": user["id"],
+            "endpoint": req.endpoint,
+            "auth": req.auth,
+            "p256dh": req.p256dh,
+            "user_agent": req.user_agent or request.headers.get("user-agent", ""),
+            "updated_at": datetime.utcnow(),
+        }, "$setOnInsert": {"created_at": datetime.utcnow()}},
+        upsert=True,
+    )
+    return {"status": "subscribed"}
+
+@app.delete("/api/v1/push/unsubscribe")
+async def unsubscribe_push(endpoint: str, user=Depends(get_current_user)):
+    """Remove a push subscription."""
+    await db.push_subscriptions.delete_one({"user_id": user["id"], "endpoint": endpoint})
+    return {"status": "unsubscribed"}
+
+@app.post("/api/v1/push/test")
+async def test_push(user=Depends(get_current_user)):
+    """Send a test push notification to the current user."""
+    svc = get_push_service(db)
+    result = await svc.send_to_user(
+        user["id"],
+        title="Nomos One — Δοκιμή",
+        body="Οι push notifications λειτουργούν κανονικά!",
+        path="/",
+    )
+    return result
