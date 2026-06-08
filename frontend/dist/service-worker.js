@@ -53,7 +53,7 @@ self.addEventListener('push', (event) => {
       badge: data.badge,
       tag: 'nomos-notification',
       data: { path: data.path },
-      requireInteraction: false,
+      requireInteraction: true,
     })
   );
 });

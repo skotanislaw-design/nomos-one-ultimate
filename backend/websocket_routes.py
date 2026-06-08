@@ -183,11 +183,13 @@ async def websocket_endpoint(
     payload = await validate_token(token)
 
     if not payload:
+        await websocket.accept()
         await websocket.close(code=4001, reason="Unauthorized")
         return
 
-    user_id = payload.get("user_id")
+    user_id = payload.get("sub")
     if not user_id:
+        await websocket.accept()
         await websocket.close(code=4001, reason="Invalid token payload")
         return
 

@@ -284,7 +284,8 @@ export function useWebSocket() {
       return;
     }
 
-    const wsUrl = `ws://${window.location.hostname}:${window.location.port || 8000}/ws`;
+    const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${wsProto}://${window.location.host}/ws`;
     const wsUrlWithParams = `${wsUrl}?token=${token}&device_id=${deviceId}`;
 
     try {
