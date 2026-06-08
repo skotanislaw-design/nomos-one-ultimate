@@ -1,1 +1,21 @@
 .env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+*.egg
+
+# Node
+node_modules/
+
+# Vite build output (tracked separately via dist/)
+# frontend/dist/
+
+# OS
+.DS_Store
+Thumbs.db
