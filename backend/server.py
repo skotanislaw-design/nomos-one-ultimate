@@ -1015,6 +1015,155 @@ async def verify_backup_code(req: BackupCodeVerifyRequest):
         logger.error(f"Backup code verification error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Backup code error: {str(e)}")
 
+
+# ── 2FA Management Endpoints ─────────────────────────────────────────────────
+
+class TOTPSetupVerifyRequest(BaseModel):
+    code: str
+
+class RegenerateCodesReq(BaseModel):
+    pass
+
+@app.post("/api/auth/2fa/setup/totp")
+async def setup_totp(user=Depends(get_current_user)):
+    """Generate TOTP secret and QR code, store pending secret on user."""
+    try:
+        import base64 as _b64
+        secret = await two_factor_service.generate_totp_secret()
+        qr_bytes = await two_factor_service.get_totp_qr_code(
+            user["id"], user["email"], secret
+        )
+        qr_url = "data:image/png;base64," + _b64.b64encode(qr_bytes).decode()
+
+        # Store encrypted pending secret so verify step can use it
+        encrypted = two_factor_service.encryption.encrypt_data(secret)
+        await db.users.update_one(
+            {"_id": make_id(user["id"])},
+            {"$set": {"two_factor_auth.pending_totp_secret": encrypted}}
+        )
+
+        return {"secret": secret, "qr_code_url": qr_url}
+    except Exception as e:
+        raise HTTPException(500, f"TOTP setup error: {str(e)}")
+
+
+@app.post("/api/auth/2fa/setup/totp/verify")
+async def verify_totp_setup(req: TOTPSetupVerifyRequest, user=Depends(get_current_user)):
+    """Verify TOTP code against pending secret and activate 2FA."""
+    try:
+        full_user = await db.users.find_one({"_id": make_id(user["id"])})
+        pending_enc = (full_user.get("two_factor_auth") or {}).get("pending_totp_secret")
+        if not pending_enc:
+            raise HTTPException(400, "TOTP setup not initiated")
+
+        secret = two_factor_service.encryption.decrypt_data(pending_enc)
+
+        # Verify code against the pending secret directly
+        import pyotp as _pyotp
+        totp = _pyotp.TOTP(secret)
+        if not totp.verify(req.code, valid_window=1):
+            raise HTTPException(400, "Μη έγκυρος κωδικός TOTP")
+
+        # Enable 2FA with this secret
+        result = await two_factor_service.enable_2fa(user["id"], OTPMethod.TOTP, secret)
+
+        # Clear pending secret
+        await db.users.update_one(
+            {"_id": make_id(user["id"])},
+            {"$unset": {"two_factor_auth.pending_totp_secret": ""}}
+        )
+
+        await audit("2fa.enabled", user["id"], "user", details={"method": "totp"})
+        return {
+            "backup_codes": result["backup_codes"],
+            "download_link": "/api/auth/2fa/backup-codes/download"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"TOTP verify error: {str(e)}")
+
+
+@app.post("/api/auth/2fa/setup/email")
+async def setup_email_2fa(user=Depends(get_current_user)):
+    """Enable email OTP 2FA."""
+    try:
+        await two_factor_service.enable_2fa(user["id"], OTPMethod.EMAIL)
+        await audit("2fa.enabled", user["id"], "user", details={"method": "email"})
+        return {"status": "email_2fa_enabled", "otp_sent": False}
+    except Exception as e:
+        raise HTTPException(500, f"Email 2FA setup error: {str(e)}")
+
+
+@app.get("/api/auth/2fa/status")
+async def get_2fa_status(user=Depends(get_current_user)):
+    """Return current 2FA configuration for the logged-in user."""
+    try:
+        status = await two_factor_service.get_2fa_status(user["id"])
+        return status
+    except Exception as e:
+        raise HTTPException(500, f"2FA status error: {str(e)}")
+
+
+@app.post("/api/auth/2fa/disable")
+async def disable_2fa(user=Depends(get_current_user)):
+    """Disable 2FA for the logged-in user."""
+    try:
+        await two_factor_service.disable_2fa(user["id"])
+        await audit("2fa.disabled", user["id"], "user")
+        return {"status": "disabled"}
+    except Exception as e:
+        raise HTTPException(500, f"Disable 2FA error: {str(e)}")
+
+
+@app.post("/api/auth/2fa/regenerate-codes")
+async def regenerate_backup_codes(user=Depends(get_current_user)):
+    """Regenerate backup codes (old ones become invalid immediately)."""
+    try:
+        new_codes = await two_factor_service.regenerate_backup_codes(user["id"])
+        await audit("2fa.backup_codes_regenerated", user["id"], "user")
+        return {"backup_codes": new_codes}
+    except Exception as e:
+        raise HTTPException(500, f"Regenerate codes error: {str(e)}")
+
+
+@app.get("/api/auth/trusted-devices")
+async def list_trusted_devices(user=Depends(get_current_user)):
+    """List all trusted devices for the logged-in user."""
+    try:
+        devices_cursor = db.devices.find({
+            "user_id": user["id"],
+            "trusted": True
+        })
+        devices = []
+        async for d in devices_cursor:
+            trust_exp = d.get("trust_expires_at")
+            if trust_exp and datetime.utcnow() > trust_exp:
+                continue  # skip expired
+            devices.append({
+                "device_id": str(d["_id"]),
+                "device_name": d.get("device_name", "Unknown"),
+                "device_type": d.get("device_type", "web"),
+                "last_seen": d.get("last_seen"),
+                "trust_expires_at": trust_exp,
+            })
+        return {"devices": devices, "count": len(devices)}
+    except Exception as e:
+        raise HTTPException(500, f"Error listing devices: {str(e)}")
+
+
+@app.post("/api/auth/trusted-devices/{device_id}/revoke")
+async def revoke_trusted_device(device_id: str, user=Depends(get_current_user)):
+    """Revoke trust for a specific device."""
+    try:
+        await two_factor_service.revoke_device_trust(user["id"], device_id)
+        await audit("device.trust_revoked", user["id"], "device", resource_id=device_id)
+        return {"status": "revoked"}
+    except Exception as e:
+        raise HTTPException(500, f"Revoke device error: {str(e)}")
+
+
+
 @app.get("/api/notifications")
 async def get_notifications(user=Depends(get_current_user)):
     now = datetime.utcnow()
